@@ -1,5 +1,7 @@
 mod utils;
 mod rust_format;
+mod docs;
+mod item_visitor;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use crossterm::{
@@ -9,15 +11,18 @@ use crossterm::{
     ExecutableCommand,
     QueueableCommand,
 };
-use rust_format::RustFormat;
-use rustdoc_types::{Crate, Id};
-use serde::Deserialize;
+use docs::Docs;
+use rust_format::print_item;
+use rustdoc_types::Id;
 use utils::{levenshtein, EmptyError, Exit, StringView, INVERT, OK};
 use std::{
-    convert::identity, fs::File, io::{stdin, stdout, BufRead, BufReader, IsTerminal, Write}, iter::once, path::PathBuf, process::{Command, Stdio}
+    convert::identity,
+    io::{stdin, stdout, BufRead, BufReader, IsTerminal, Write},
+    iter::once,
+    process::{Command, Stdio},
 };
 
-use crate::utils::{ReadExt, Result, StrExt, StringExt, NL, NULL_EVENT, NOSTYLE, BOLD};
+use crate::utils::{Result, NL, NULL_EVENT, NOSTYLE, BOLD};
 
 /// if `None` is returned, the app is supposed to exit.
 fn next_key_event() -> Result<KeyEvent> {
@@ -31,17 +36,14 @@ fn next_key_event() -> Result<KeyEvent> {
 }
 
 struct Ctx {
-    docs: Crate,
+    docs: Docs,
     window_height: u16,
 }
 
 impl Ctx {
     const DEFAULT_WINHEIGHT: u16 = 15;
 
-    fn new(
-        r#in: &mut impl BufRead,
-        out: &mut (impl Write + IsTerminal),
-    ) -> Result<Self> {
+    fn new(r#in: &mut impl BufRead, out: &mut (impl Write + IsTerminal)) -> Result<Self> {
         let toolchains = Command::new("rustup")
             .args(["toolchain", "list"])
             .stderr(Stdio::inherit())
@@ -68,78 +70,18 @@ impl Ctx {
             };
             ensure!(install_nightly, EmptyError);
 
-            let mut installer = Command::new("rustup")
+            let status = Command::new("rustup")
                 .args(["toolchain", "install", "nightly"])
                 .stderr(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .spawn()?;
-
-            ensure!(installer.wait()?.success(), "`rustup` failed");
+                .status()
+                .context("failed to launch `rustup toolchain install nightly`")?;
+            ensure!(status.success(), "`rustup` failed");
 
             "nightly"
         };
 
-        let mut doc_gen = Command::new("rustup")
-            .args([
-                "run",
-                toolchain,
-                "cargo",
-                "rustdoc",
-                "-Zunstable-options",
-                "--output-format=json",
-                "--color=always",
-            ])
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let docspath: PathBuf = doc_gen
-            .stderr
-            .as_mut()
-            .context("failed to get the stderr of `cargo rustdoc`")?
-            // TODO: remove this allocation
-            .buffered_lines()
-            .map(|x| x.and_then(|line| {
-                writeln!(out, "{line}")?;
-                Ok(line)
-            }))
-            .take_while(Result::is_ok)
-            .last()
-            .context("`cargo doc`'s stderr empty")?
-            .context("failed to process stderr of `cargo doc`")?
-            // Safety: the second return value of `split_once` starts right after the delimiter
-            .try_map(|last| unsafe {
-                last.split_once('/')
-                    .context("`cargo doc`'s stderr malformatted") 
-                    .map(|s| s.1.stretch_left(1))
-            })?
-            .into();
-        if !doc_gen.wait()?.success() {
-            bail!("`cargo rustdoc` failed");
-        }
-        writeln!(out, "Reading the index from {}", docspath.display())?;
-
-        let docs: Crate = match serde_json::from_reader(File::open(&docspath)?) {
-            Ok(x) => x,
-            Err(e) => {
-                #[derive(Deserialize)]
-                struct V {
-                    format_version: u32,
-                }
-                let V { format_version } = serde_json::from_reader(File::open(&docspath)?)?;
-                if format_version != rustdoc_types::FORMAT_VERSION {
-                    bail!("incompatible version of rustdoc's JSON output: expected {}, got {}",
-                        rustdoc_types::FORMAT_VERSION, format_version);
-                }
-                bail!(e)
-            }
-        };
-
-        if docs.format_version != rustdoc_types::FORMAT_VERSION {
-            bail!("incompatible version of rustdoc's JSON output: expected {}, got {}",
-                rustdoc_types::FORMAT_VERSION, docs.format_version);
-        }
-
-        Ok(Self{ docs, window_height: Self::DEFAULT_WINHEIGHT })
+        Ok(Self{ docs: Docs::new(toolchain, out)?, window_height: Self::DEFAULT_WINHEIGHT })
     }
 }
 
@@ -195,7 +137,7 @@ impl<'ctx> SearchMode<'ctx> {
         self.print_results(ctx, out)
     }
 
-    fn get_results(&mut self, docs: &'ctx Crate) {
+    fn get_results(&mut self, docs: &'ctx Docs) {
         self.results.clear();
         for (id, item) in &docs.paths {
             let distance = item.path.iter()
@@ -290,7 +232,7 @@ impl DocViewMode {
             return Ok(None);
         };
         let mut content = Vec::new();
-        item.print(&mut content)?;
+        print_item(item, &mut content)?;
         Ok(Some(StringView::new(String::from_utf8(content)?, -1, -1)))
     }
 
