@@ -1,14 +1,10 @@
-use std::{fmt::Display, io::Write};
+use std::{fmt::{Display, Write}, mem::take};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use rustdoc_types::{
-    Abi, Constant, Discriminant, DynTrait, Enum, FnDecl, Function, FunctionPointer,
-    GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Impl,
-    Import, Item, ItemEnum, MacroKind, Path, PolyTrait, ProcMacro, Static, Struct, StructKind,
-    Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind, Union,
-    Variant, VariantKind, WherePredicate
+    Abi, Constant, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Import, Item, ItemEnum, MacroKind, Path, PolyTrait, ProcMacro, Static, Struct, StructKind, Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind, Union, VariantKind, Visibility, WherePredicate
 };
-use crate::{docs::Infer, item_visitor::{visit_type, Visitor}, utils::{BoolExt, Result, OK}};
+use crate::{docs::{Docs, Infer}, item_visitor::{visit_type, Visitor}, utils::{BoolExt, Result, OK}};
 
 struct Formatter<W>(W);
 
@@ -55,8 +51,8 @@ impl<W: Write> Formatter<W> {
     fn print_generics<E: Into<anyhow::Error>>(
         &mut self,
         item: &Generics,
-        f: impl FnOnce(&mut Self) -> Result<(), E>,
         postfix: impl Display,
+        f: impl FnOnce(&mut Self) -> Result<(), E>,
     ) -> Result {
         let params = item.params.iter().filter(|i| match i.kind {
             GenericParamDefKind::Type { synthetic, .. } => !synthetic,
@@ -77,7 +73,7 @@ impl<W: Write> Formatter<W> {
 
 impl<W: Write> Visitor for Formatter<W> {
     fn visit_lifetime(&mut self, x: &String) -> Result {
-        write!(self.0, "'{x}").map_err(Into::into)
+        write!(self.0, "{x}").map_err(Into::into)
     }
 
     fn visit_infer(&mut self, _: &Infer) -> Result {
@@ -187,7 +183,7 @@ impl<W: Write> Visitor for Formatter<W> {
             Type::BorrowedRef { lifetime, mutable, type_ } => {
                 write!(self.0, "&")?;
                 if let Some(lifetime) = lifetime {
-                    write!(self.0, "'{lifetime} ")?;
+                    write!(self.0, "{lifetime} ")?;
                 }
                 if *mutable {
                     write!(self.0, "mut ")?;
@@ -276,7 +272,7 @@ impl<W: Write> Visitor for Formatter<W> {
                 }
                 self.visit_path(trait_)?;
             }
-            GenericBound::Outlives(lifetime) => write!(self.0, "'{lifetime}")?,
+            GenericBound::Outlives(lifetime) => self.visit_lifetime(lifetime)?,
         }
         OK
     }
@@ -288,9 +284,9 @@ impl<W: Write> Visitor for Formatter<W> {
                 self.print_with_sep(Self::visit_lifetime, ": ", outlives, " + ", "")?;
             }
             GenericParamDefKind::Type { bounds, default, .. } => {
-                write!(self.0, "{}: ", x.name)?;
-                self.print_with_sep(Self::visit_generic_bound, "", bounds, " + ", "")?;
-                self.maybe_print(Self::visit_type," = ", default, "")?;
+                write!(self.0, "{}", x.name)?;
+                self.print_with_sep(Self::visit_generic_bound, ": ", bounds, " + ", "")?;
+                self.maybe_print(Self::visit_type, " = ", default, "")?;
             }
             GenericParamDefKind::Const { type_, default } => {
                 write!(self.0, "const {}: ", x.name)?;
@@ -315,7 +311,7 @@ impl<W: Write> Visitor for Formatter<W> {
             }
 
             WherePredicate::RegionPredicate { lifetime, bounds } => {
-                write!(self.0, "'{lifetime}")?;
+                self.visit_lifetime(lifetime)?;
                 self.print_with_sep(Self::visit_generic_bound, ": ", bounds, " + ", "")?;
             }
 
@@ -329,15 +325,29 @@ impl<W: Write> Visitor for Formatter<W> {
     }
 
     fn visit_generics(&mut self, x: &Generics) -> Result {
-        self.print_generics(x, |_| OK, ",\n")
+        self.print_generics(x, ",\n", |_| OK)
+    }
+
+    fn visit_visibility(&mut self, x: &Visibility) -> Result {
+        match x {
+            Visibility::Public => write!(self.0, "pub ")?,
+            Visibility::Default => {}
+            Visibility::Crate => write!(self.0, "pub(crate) ")?,
+            Visibility::Restricted { path, .. } => if !path.starts_with("::") {
+                write!(self.0, "pub(in {path}) ")?;
+            }
+        }
+        OK
     }
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
+pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
     let mut fmt = Formatter(out);
 
     match &item.inner {
+        ItemEnum::Impl(_) | ItemEnum::Variant(_) | ItemEnum::StructField(_) => {}
+
         ItemEnum::Module(_) => {
             let name = item.name.as_ref().context("no module name")?;
             write!(fmt.0, "mod {name};")?;
@@ -362,75 +372,196 @@ pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
             write!(fmt.0, ";")?;
         }
 
-        ItemEnum::Union(Union { generics, .. }) => {
+        ItemEnum::Union(Union { generics, fields, fields_stripped, .. }) => {
             let name = item.name.as_ref().context("no union name")?;
             write!(fmt.0, "union {name}")?;
             fmt.visit_generics(generics)?;
-            // TODO
-            write!(fmt.0, "{}{{ ... }}", generics.where_predicates.is_empty().pick(" ", ""))?;
+            write!(fmt.0, "{}{{", generics.where_predicates.is_empty().pick(" ", ""))?;
+            if !fields.is_empty() || *fields_stripped {
+                writeln!(fmt.0)?;
+            }
+            for field_id in fields {
+                let Some(field) = docs.index.get(field_id) else {
+                    bail!("no union field found");
+                };
+                let Some(field_name) = &field.name else {
+                    bail!("no union field name found");
+                };
+                let ItemEnum::StructField(field_ty) = &field.inner else {
+                    bail!("no union field type found");
+                };
+                write!(fmt.0, "    ")?;
+                fmt.visit_visibility(&field.visibility)?;
+                write!(fmt.0, "{field_name}: ")?;
+                fmt.visit_type(field_ty)?;
+                writeln!(fmt.0, ",")?;
+            }
+            if *fields_stripped {
+                writeln!(fmt.0, "    ...")?;
+            }
+            write!(fmt.0, "}}")?;
         }
 
         ItemEnum::Struct(Struct { kind, generics, .. }) => {
             let name = item.name.as_ref().context("no struct name")?;
             write!(fmt.0, "struct {name}")?;
             match kind {
-                StructKind::Unit => {
-                    fmt.visit_generics(generics)?;
-                    write!(fmt.0, ";")?;
+                StructKind::Unit => write!(fmt.0, ";")?,
+
+                StructKind::Tuple(fields) => {
+                    fmt.print_generics(generics, "", |fmt| {
+                        write!(fmt.0, "(")?;
+                        let [mut fields_stripped, mut first] = [false, true];
+                        for field_id in fields {
+                            let Some(field_id) = field_id else {
+                                fields_stripped = true;
+                                continue;
+                            };
+                            let Some(field) = docs.index.get(field_id) else {
+                                bail!("no struct field found");
+                            };
+                            let ItemEnum::StructField(field_ty) = &field.inner else {
+                                bail!("no struct field type found");
+                            };
+                            if !take(&mut first) {
+                                write!(fmt.0, ", ")?;
+                            }
+                            fmt.visit_visibility(&field.visibility)?;
+                            fmt.visit_type(field_ty)?;
+                        }
+                        if fields_stripped {
+                            write!(fmt.0, "{}...", first.pick("", ", "))?;
+                        }
+                        write!(fmt.0, ");")?;
+                        OK
+                    })?;
                 }
 
-                StructKind::Tuple(_) => {
-                    fmt.print_generics(generics, |fmt| write!(fmt.0, "(...)"), "")?;
-                    write!(fmt.0, ";")?;
-                }
-
-                StructKind::Plain { .. } => {
+                StructKind::Plain { fields, fields_stripped } => {
                     fmt.visit_generics(generics)?;
-                    // TODO
-                    write!(fmt.0, "{}{{ ... }}", generics.where_predicates.is_empty().pick(" ", ""))?;
+                    write!(fmt.0, "{}{{", generics.where_predicates.is_empty().pick(" ", ""))?;
+                    if !fields.is_empty() || *fields_stripped {
+                        writeln!(fmt.0)?;
+                    }
+                    for field_id in fields {
+                        let Some(field) = docs.index.get(field_id) else {
+                            bail!("no struct field found");
+                        };
+                        let Some(field_name) = &field.name else {
+                            bail!("no struct field name found");
+                        };
+                        let ItemEnum::StructField(field_ty) = &field.inner else {
+                            bail!("no struct field type found");
+                        };
+                        write!(fmt.0, "    ")?;
+                        fmt.visit_visibility(&field.visibility)?;
+                        write!(fmt.0, "{field_name}: ")?;
+                        fmt.visit_type(field_ty)?;
+                        writeln!(fmt.0, ",")?;
+                    }
+                    if *fields_stripped {
+                        writeln!(fmt.0, "    ...")?;
+                    }
+                    write!(fmt.0, "}}")?;
                 }
             }
         }
 
-        ItemEnum::StructField(field) => {
-            let name = item.name.as_ref().context("no struct field name")?;
-            writeln!(fmt.0, "struct ... {{")?;
-            write!(fmt.0,  "    {name}: ")?;
-            fmt.visit_type(field)?;
-            write!(fmt.0, ",\n}}")?;
-        }
-
-        ItemEnum::Enum(Enum { generics, .. }) => {
+        ItemEnum::Enum(Enum { generics, variants, variants_stripped, .. }) => {
             let name = item.name.as_ref().context("no enum name")?;
             write!(fmt.0, "enum {name}")?;
             fmt.visit_generics(generics)?;
-            // TODO
-            write!(fmt.0, "{}{{ ... }}", generics.where_predicates.is_empty().pick(" ", ""))?;
-        }
+            write!(fmt.0, "{}{{", generics.where_predicates.is_empty().pick(" ", ""))?;
+            if !variants.is_empty() || *variants_stripped {
+                writeln!(fmt.0)?;
+            }
 
-        ItemEnum::Variant(Variant { kind, discriminant }) => {
-            let name = item.name.as_ref().context("no enum variant name")?;
-            writeln!(fmt.0, "enum ... {{")?;
-            write!(fmt.0,  "    {name}")?;
-            match kind {
-                VariantKind::Plain => {}
-                // TODO
-                VariantKind::Tuple(_) => write!(fmt.0, "(...)")?,
-                // TODO
-                VariantKind::Struct { .. } => write!(fmt.0, "{{ ... }}")?,
+            for variant_id in variants {
+                let Some(variant) = docs.index.get(variant_id) else {
+                    bail!("no enum variant found");
+                };
+                let Some(variant_name) = &variant.name else {
+                    bail!("no enum variant name found");
+                };
+                let ItemEnum::Variant(variant) = &variant.inner else {
+                    bail!("enum variant is not an enum variant");
+                };
+                write!(fmt.0, "    ")?;
+                write!(fmt.0, "{variant_name}")?;
+                match &variant.kind {
+                    VariantKind::Plain => {}
+
+                    VariantKind::Tuple(fields) => {
+                        write!(fmt.0, "(")?;
+                        let [mut fields_stripped, mut first] = [false, true];
+                        for field_id in fields {
+                            let Some(field_id) = field_id else {
+                                fields_stripped = true;
+                                continue;
+                            };
+                            let Some(field) = docs.index.get(field_id) else {
+                                bail!("no enum variant field found");
+                            };
+                            let ItemEnum::StructField(field_ty) = &field.inner else {
+                                bail!("no enum variant field type found");
+                            };
+                            if !take(&mut first) {
+                                write!(fmt.0, ", ")?;
+                            }
+                            fmt.visit_visibility(&field.visibility)?;
+                            fmt.visit_type(field_ty)?;
+                        }
+                        if fields_stripped {
+                            write!(fmt.0, "{}...", first.pick("", ", "))?;
+                        }
+                        write!(fmt.0, ")")?;
+                    }
+
+                    VariantKind::Struct { fields, fields_stripped } => {
+                        write!(fmt.0, " {{")?;
+                        if !fields.is_empty() || *fields_stripped {
+                            writeln!(fmt.0)?;
+                        }
+                        for field_id in fields {
+                            let Some(field) = docs.index.get(field_id) else {
+                                bail!("no enum variant field found");
+                            };
+                            let Some(field_name) = &field.name else {
+                                bail!("no enum variant field name found");
+                            };
+                            let ItemEnum::StructField(field_ty) = &field.inner else {
+                                bail!("no enum variant field type found");
+                            };
+                            write!(fmt.0, "        ")?;
+                            fmt.visit_visibility(&field.visibility)?;
+                            write!(fmt.0, "{field_name}: ")?;
+                            fmt.visit_type(field_ty)?;
+                            writeln!(fmt.0, ",")?;
+                        }
+                        if *fields_stripped {
+                            writeln!(fmt.0, "        ...")?;
+                        }
+                        write!(fmt.0, "    }}")?;
+                    }
+                }
+                if let Some(discriminant) = &variant.discriminant {
+                    write!(fmt.0, " = {}", discriminant.value)?;
+                }
+                writeln!(fmt.0, ",")?;
             }
-            if let Some(Discriminant { value, .. }) = discriminant {
-                write!(fmt.0, " = {value}")?;
+
+            if *variants_stripped {
+                writeln!(fmt.0, "    ...")?;
             }
-            write!(fmt.0, ",\n}}")?;
+            write!(fmt.0, "}}")?;
         }
 
         ItemEnum::Function(Function { decl, generics, header, has_body }) => {
             let name = item.name.as_ref().context("no function name")?;
             fmt.visit_header(header)?;
             write!(fmt.0, "fn {name}")?;
-            let [postfix, end] = has_body.pick([",\n", "{ ... }"], ["", ";"]);
-            fmt.print_generics(generics, |fmt| fmt.visit_fn_decl(decl), postfix)?;
+            let [postfix, end] = has_body.pick([",\n", " { ... }"], ["", ";"]);
+            fmt.print_generics(generics, postfix, |fmt| fmt.visit_fn_decl(decl))?;
             write!(fmt.0, "{end}")?;
         }
 
@@ -445,8 +576,8 @@ pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
             write!(fmt.0, "trait {name}")?;
             fmt.print_generics(
                 generics,
-                |fmt| fmt.print_with_sep(Formatter::visit_generic_bound, ": ", bounds, " + ", ""),
                 ",\n",
+                |fmt| fmt.print_with_sep(Formatter::visit_generic_bound, ": ", bounds, " + ", ""),
             )?;
             write!(fmt.0, "{}{{ ... }}", generics.where_predicates.is_empty().pick(" ", ""))?;
         }
@@ -456,35 +587,19 @@ pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
             write!(fmt.0, "trait {name}")?;
             fmt.print_generics(
                 generics,
-                |fmt| fmt.print_with_sep(Formatter::visit_generic_bound, ": ", params, " + ", ""),
                 "",
+                |fmt| fmt.print_with_sep(Formatter::visit_generic_bound, ": ", params, " + ", ""),
             )?;
             write!(fmt.0, ";")?;
-        }
-
-        ItemEnum::Impl(Impl { is_unsafe, generics, trait_, for_, negative, .. }) => {
-            if *is_unsafe {
-                write!(fmt.0, "unsafe ")?;
-            }
-            write!(fmt.0, "impl")?;
-            fmt.print_generics(
-                generics,
-                |fmt| {
-                    let prefix = negative.pick(" !", " ");
-                    fmt.maybe_print(Formatter::visit_path, prefix, trait_, " for")?;
-                    write!(fmt.0, " ")?;
-                    fmt.visit_type(for_)?;
-                    OK
-                },
-                ",\n",
-            )?;
-            write!(fmt.0, "{}{{ ... }}", generics.where_predicates.is_empty().pick(" ", ""))?;
         }
 
         ItemEnum::TypeAlias(TypeAlias { type_, generics }) => {
             let name = item.name.as_ref().context("no type alias name")?;
             write!(fmt.0, "type {name}")?;
-            fmt.print_generics(generics, |fmt| {write!(fmt.0, " = ")?; fmt.visit_type(type_)}, "")?;
+            fmt.print_generics(generics, "", |fmt| {
+                write!(fmt.0, " = ")?;
+                fmt.visit_type(type_)
+            })?;
             write!(fmt.0, ";")?;
         }
 
@@ -510,7 +625,7 @@ pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
             write!(fmt.0, "extern type {name};")?;
         }
 
-        ItemEnum::Macro(name) => write!(fmt.0, "macro_rules! {name}")?,
+        ItemEnum::Macro(body) => write!(fmt.0, "{body}")?,
 
         ItemEnum::ProcMacro(ProcMacro { kind, helpers }) => {
             let name = item.name.as_ref().context("no proc macro name")?;
@@ -557,12 +672,12 @@ pub fn print_item(item: &Item, out: &mut impl Write) -> Result {
             write!(fmt.0, "type {name}")?;
             fmt.print_generics(
                 generics,
+                "",
                 |fmt| {
                     fmt.print_with_sep(Formatter::visit_generic_bound, ": ", bounds, " + ", "")?;
                     fmt.maybe_print(Formatter::visit_type, " = ", default, "")?;
                     OK
-                },
-                "",
+                }
             )?;
             write!(fmt.0, ";")?;
         }

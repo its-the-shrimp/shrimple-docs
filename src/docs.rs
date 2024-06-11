@@ -1,8 +1,13 @@
-use std::{borrow::Cow, collections::HashMap, fs::File, io::Write, iter::once, ops::Range, process::{Command, Stdio}, ptr::{addr_of, addr_of_mut}};
+use std::{collections::HashMap, convert::identity, io::Write, ops::Range, path::Path, process::{Command, Stdio}, ptr::{addr_of, addr_of_mut}, sync::Arc};
 use anyhow::{bail, Context};
 use rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemSummary, Type, FORMAT_VERSION};
 use serde::Deserialize;
-use crate::{item_visitor::VisitorMut, stack_format, utils::{ReadExt, Result, StrExt, StringExt, BOLD, GREEN, NOSTYLE, OK}};
+use tokio::{fs::read_to_string, task::JoinSet};
+use crate::{
+    item_visitor::VisitorMut,
+    utils::{levenshtein, BoolExt, Result, BOLD, GREEN, NOSTYLE, OK, CLEARLINE},
+};
+use crossterm::{cursor::MoveToPreviousLine, ExecutableCommand};
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
 pub type FnArg = (String, Type);
@@ -34,10 +39,10 @@ pub struct Target<'src> {
 #[derive(Debug, Deserialize)]
 struct Package<'src> {
     /// Changed to the lib name, or name with hyphens replaced with underscores
-    name: Cow<'src, str>,
-    id: &'src str,
+    name: String,
+    #[serde(borrow)]
     targets: Vec<Target<'src>>,
-    manifest_path: Option<&'src str>,
+    manifest_path: Option<String>,
 }
 
 impl<'src> Package<'src> {
@@ -45,7 +50,6 @@ impl<'src> Package<'src> {
     fn builtin(name: &'src str) -> Self {
         Self {
             name: name.into(),
-            id: name,
             targets: vec![],
             manifest_path: None,
         }
@@ -55,15 +59,9 @@ impl<'src> Package<'src> {
         self.name = self.targets
             .iter()
             .find(|t| t.kind.contains(&"lib"))
-            .map_or_else(|| self.name.replace('-', "_").into(), |t| t.name.into());
+            .map_or_else(|| self.name.replace('-', "_"), |t| t.name.into());
         self.targets = vec![];
     }
-}
-
-#[derive(Deserialize)]
-struct Root<'src> {
-    #[serde(borrow)]
-    root: Option<&'src str>,
 }
 
 #[derive(Deserialize)]
@@ -71,121 +69,97 @@ struct Root<'src> {
 struct CargoMetadata<'src> {
     #[serde(borrow)]
     packages: Vec<Package<'src>>,
-    resolve: Option<Root<'src>>,
 }
 
-/// Aggregator of all the docs
-#[derive(Default)]
-pub struct Docs {
-    pub index: HashMap<Id, Item>,
-    pub paths: HashMap<Id, ItemSummary>,
+struct IdNormaliser<'docs> {
+    paths: &'docs HashMap<Id, ItemSummary>,
+    crate_name: &'docs str,
+    crates: &'docs HashMap<u32, ExternalCrate>,
+    ranges_temp: Vec<(Range<usize>, &'docs str)>,
 }
 
-struct CrateIdMapper {
-    map: HashMap<u32, u32>,
-    ranges_temp: Vec<(Range<usize>, u32)>,
-}
-
-impl VisitorMut for CrateIdMapper {
+impl VisitorMut for IdNormaliser<'_> {
     #[allow(clippy::cast_possible_wrap)]
     fn visit_id(&mut self, x: &mut Id) -> Result {
-        if x.0.starts_with(['a', 'b']) {
-            return OK;
-        }
+        if let Some(item) = self.paths.get(x) {
+            *x = Id(item.path.join("::"));
+        } else {
+            let init_off = matches!(x.0.as_bytes(), [b'a' | b'b', b':', ..]).pick(2, 0);
+            let mut off = init_off;
+            for id in x.0[off..].split('-') {
+                let crate_id_str = id.split_once(':').map_or(id, |x| x.0);
+                let crate_id = crate_id_str
+                    .parse()
+                    .with_context(|| format!("item ID {:?} is malformatted", x.0))?;
+                let new_crate_name = match crate_id {
+                    0 => self.crate_name,
+                    _ => self.crates.get(&crate_id)
+                        .map(|x| &x.name)
+                        .with_context(|| {
+                            format!("unknown crate ID: {crate_id_str:?}\n\tfull ID: {}", x.0)
+                        })?
+                };
+                self.ranges_temp.push((off .. off + crate_id_str.len(), new_crate_name));
+                off += id.len() + 1;
+            }
 
-        let mut off = 0;
-        for id in x.0.split('-') {
-            let crate_id_str = id.split_once(':').map_or(id, |x| x.0);
-            let crate_id = crate_id_str
-                .parse()
-                .with_context(|| format!("item ID {:?} is malformatted", x.0))?;
-            let Some(&new_crate_id) = self.map.get(&crate_id) else {
-                bail!("unknown crate ID: {crate_id_str:?}\n\tfull ID: {}", x.0);
-            };
-            self.ranges_temp.push((off .. off + crate_id_str.len(), new_crate_id));
-            off += id.len() + 1;
-        }
-        let mut off = 0isize;
-        for (mut range, new_crate_id) in self.ranges_temp.drain(..) {
-            range.start = range.start.wrapping_add_signed(off);
-            range.end = range.end.wrapping_add_signed(off);
-            let new_crate_id_str = stack_format!(cap: 20, "{new_crate_id}")?;
-            x.0.replace_range(range.clone(), &new_crate_id_str);
-            off += new_crate_id_str.len().wrapping_sub(range.end - range.start) as isize;
+            let mut off = 0isize;
+            for (mut range, new_crate_name) in self.ranges_temp.drain(..) {
+                range.start = range.start.wrapping_add_signed(off);
+                range.end = range.end.wrapping_add_signed(off);
+                x.0.replace_range(range.clone(), new_crate_name);
+                off += new_crate_name.len().wrapping_sub(range.end - range.start) as isize;
+            }
+            x.0.replace_range(..init_off, "$:");
         }
         OK
     }
 }
 
-impl CrateIdMapper {
-    /// `dst` must be sorted by `Package::name`
-    fn new(crate_dst_id: u32, src_index: HashMap<u32, ExternalCrate>, dst_index: &[Package])
-        -> Self
-    {
-        let mut map: HashMap<u32, u32> = src_index.into_iter()
-            .filter_map(|(id, x)| dst_index.binary_search_by_key(&&*x.name, |p| &p.name)
-                //.inspect_err(|_| eprintln!("warning: could not find crate {:?}", x.name))
-                .ok()
-                .and_then(|new_id| new_id.try_into().ok())
-                .map(|new_id| (id, new_id)))
-            .collect();
-        map.insert(0, crate_dst_id);
-        Self { map, ranges_temp: vec![] }
-    }
-}
-
 /// `out` is only used for logging
-fn gen_rustdoc_crate(
-    name: &str,
-    manifest_path: Option<&str>,
-    toolchain: &str,
-    out: &mut impl Write,
-) -> Result<Crate> {
-    writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} {name}")?;
-
-    let mut docs_gen = Command::new("rustup")
+async fn document_crate(
+    name: impl AsRef<str> + Send,
+    manifest_path: impl AsRef<str> + Send,
+    toolchain: impl AsRef<str> + Send,
+) -> Result<HashMap<Id, Item>> {
+    let manifest_path = manifest_path.as_ref();
+    let name = name.as_ref();
+    let docs_gen = tokio::process::Command::new("rustup")
         .args([
             "run",
-            toolchain,
+            toolchain.as_ref(),
             "cargo",
             "rustdoc",
+            "--manifest-path",
+            manifest_path,
             "--color=always",
             "-Zunstable-options",
             "--output-format=json",
         ])
-        .args(manifest_path.into_iter().flat_map(|path| ["--manifest-path", path]))
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
-        .spawn()?;
+        .output().await?;
+    if !docs_gen.status.success() {
+        bail!("`cargo rustdoc` failed; output:\n{}", String::from_utf8_lossy(&docs_gen.stderr));
+    }
 
-    let docs_path = docs_gen
-        .stderr
-        .as_mut()
-        .context("failed to get the stderr of `cargo rustdoc`")?
-        // TODO: remove this allocation
-        .buffered_lines()
-        .take_while(Result::is_ok)
-        .last()
-        .context("`cargo doc`'s stderr empty")?
-        .context("failed to process stderr of `cargo doc`")?
-        // Safety: the second return value of `split_once` starts right after the delimiter
-        .try_map(|last| unsafe {
-            if !docs_gen.wait()?.success() {
-                bail!("`cargo rustdoc` failed");
-            }
-            last.split_once('/')
-                .context("`cargo rustdoc`'s stderr malformatted") 
-                .map(|s| s.1.stretch_left(1))
-        })?;
+    let mut docs_path = Path::new(manifest_path)
+        .parent().context("invalid Cargo manifest path")?
+        .to_owned();
+    docs_path.push("target");
+    docs_path.push("doc");
+    docs_path.push(name);
+    docs_path.set_extension("json");
+    let json = read_to_string(docs_path).await?;
 
-    let docs: Crate = match serde_json::from_reader(File::open(&docs_path)?) {
+    let docs: Crate = match serde_json::from_str(&json) {
         Ok(x) => x,
         Err(e) => {
             #[derive(Deserialize)]
             struct V {
                 format_version: u32,
             }
-            let V { format_version } = serde_json::from_reader(File::open(&docs_path)?)?;
+            let V { format_version } = serde_json::from_str(&json)?;
             if format_version != FORMAT_VERSION {
                 bail!("incompatible version of rustdoc's JSON output: expected {}, got {}",
                     FORMAT_VERSION, format_version);
@@ -198,13 +172,39 @@ fn gen_rustdoc_crate(
         bail!("incompatible version of rustdoc's JSON output: expected {}, got {}",
             FORMAT_VERSION, docs.format_version);
     }
-    Ok(docs)
+
+    let mut id_normaliser = IdNormaliser {
+        paths: &docs.paths,
+        crate_name: name,
+        crates: &docs.external_crates,
+        ranges_temp: Vec::with_capacity(2),
+    };
+    
+    docs.index.into_iter()
+        //.filter(|(k, _)| k.0.starts_with("0:"))
+        .map(|(mut k, mut item)| {
+            id_normaliser.visit_id(&mut k)?;
+            id_normaliser.visit_item(&mut item)?;
+            Ok((k, item))
+        })
+        .collect()
+}
+
+/// Filled in by [`Docs::search`]
+pub struct SearchResult<'docs> {
+    /// [`Id`] usable to index the docs directly.
+    pub id: &'docs Id,
+    /// Levenshtein distance from the searched term.
+    pub distance: usize,
+}
+
+/// Aggregator of all the docs
+pub struct Docs {
+    pub index: HashMap<Id, Item>,
 }
 
 impl Docs {
-    pub fn new(toolchain: &str, out: &mut impl Write) -> Result<Self> {
-        let mut res = Self::default();
-
+    pub async fn new(toolchain: &Arc<str>, out: &mut (impl Write + Send)) -> Result<Self> {
         writeln!(out, "{GREEN}{BOLD}Extracting{NOSTYLE} cargo metadata")?;
         let cmd = Command::new("rustup")
             .args([
@@ -219,10 +219,7 @@ impl Docs {
         if !cmd.status.success() {
             bail!("`cargo metadata` failed");
         }
-        let CargoMetadata { mut packages, resolve } = serde_json::from_slice(&cmd.stdout)?;
-        let Some(Root { root: Some(root_abs_id) }) = resolve else {
-            bail!("`cargo metadata` didn't provide a dependency graph")
-        };
+        let CargoMetadata { mut packages, .. } = serde_json::from_slice(&cmd.stdout)?;
 
         packages.iter_mut().for_each(Package::normalise_name);
         packages.push(Package::builtin("std"));
@@ -231,43 +228,36 @@ impl Docs {
         packages.push(Package::builtin("proc_macro"));
         packages.sort_unstable_by(|p1, p2| p1.name.cmp(&p2.name));
 
-        let (root_id, root) = packages
-            .iter()
-            .enumerate()
-            .find(|x| x.1.id == root_abs_id)
-            .context("root package not found")?;
-        for (crate_id, Package { name, manifest_path, .. }) in once((root_id, root))
-            .chain(packages.iter().enumerate().filter(|x| x.0 != root_id))
-        {
-            let Some(manifest_path) = manifest_path else {
-                continue;
-            };
-            let crate_id = u32::try_from(crate_id).ok().context("too many crates")?;
-            let docs = gen_rustdoc_crate(name, Some(manifest_path), toolchain, out)?;
-        
-            let mut crate_id_mapper = CrateIdMapper::new(crate_id, docs.external_crates, &packages);
+        let n_packages = packages.len();
+        let mut n_processed = 0usize;
+        writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... 0 / {n_packages}")?;
+        let mut documentors: JoinSet<_> = packages
+            .into_iter()
+            .filter_map(|package| package.manifest_path.zip(Some(package.name)))
+            .map(|(manifest_path, name)| document_crate(name, manifest_path, toolchain.clone()))
+            .collect();
 
-            res.paths.extend(docs.paths.into_iter().filter_map(|(mut k, summary)| {
-                if k.0.starts_with(['a', 'b']) || !k.0.starts_with("0:") {
-                    return None;
-                }
-
-                crate_id_mapper.visit_id(&mut k).ok()?;
-                Some((k, summary))
-            }));
-
-            let mut err = OK;
-            res.index.extend(docs.index.into_iter().filter_map(|(mut k, mut item)| {
-                if err.is_err() || k.0.starts_with(['a', 'b']) || !k.0.starts_with("0:") {
-                    return None;
-                }
-                crate_id_mapper.visit_id(&mut k).map_err(|e| err = Err(e)).ok()?;
-                crate_id_mapper.visit_item(&mut item).map_err(|e| err = Err(e)).ok()?;
-                Some((k, item))
-            }));
-            err?;
+        let mut res = Self { index: HashMap::new() };
+        while let Some(items) = documentors.join_next().await {
+            res.index.extend(items??);
+            n_processed += 1;
+            out.execute(MoveToPreviousLine(1))?;
+            writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
+                         {n_processed} / {n_packages}")?;
         }
-
         Ok(res)
+    }
+
+    pub fn search<'docs>(&'docs self, term: &str, dst: &mut Vec<SearchResult<'docs>>) {
+        dst.clear();
+        for id in self.index.keys() {
+            if matches!(id.0.as_bytes(), [b'a' | b'b' | b'$', b':', ..]) {
+                continue;
+            }
+            let distance = levenshtein(term, id.0.rsplit_once(':').map_or(&id.0, |x| x.1));
+            let place = dst.binary_search_by_key(&distance, |res| res.distance)
+                .unwrap_or_else(identity);
+            dst.insert(place, SearchResult { id, distance });
+        }
     }
 }

@@ -11,15 +11,14 @@ use crossterm::{
     ExecutableCommand,
     QueueableCommand,
 };
-use docs::Docs;
+use docs::{Docs, SearchResult};
 use rust_format::print_item;
 use rustdoc_types::Id;
-use utils::{levenshtein, EmptyError, Exit, StringView, INVERT, OK};
+use utils::{str_char_count, EmptyError, Exit, StringView, INVERT, OK};
 use std::{
-    convert::identity,
-    io::{stdin, stdout, BufRead, BufReader, IsTerminal, Write},
+    io::{stdin, stdout, BufRead, BufReader, Write},
     iter::once,
-    process::{Command, Stdio},
+    process::{Command, Stdio}, sync::Arc,
 };
 
 use crate::utils::{Result, NL, NULL_EVENT, NOSTYLE, BOLD};
@@ -43,7 +42,10 @@ struct Ctx {
 impl Ctx {
     const DEFAULT_WINHEIGHT: u16 = 15;
 
-    fn new(r#in: &mut impl BufRead, out: &mut (impl Write + IsTerminal)) -> Result<Self> {
+    async fn new(
+        r#in: &mut (impl BufRead + Send),
+        out: &mut (impl Write + Send),
+    ) -> Result<Self> {
         let toolchains = Command::new("rustup")
             .args(["toolchain", "list"])
             .stderr(Stdio::inherit())
@@ -81,7 +83,10 @@ impl Ctx {
             "nightly"
         };
 
-        Ok(Self{ docs: Docs::new(toolchain, out)?, window_height: Self::DEFAULT_WINHEIGHT })
+        Ok(Self{
+            docs: Docs::new(&Arc::from(toolchain), out).await?,
+            window_height: Self::DEFAULT_WINHEIGHT,
+        })
     }
 }
 
@@ -89,65 +94,44 @@ struct SearchMode<'ctx> {
     selected: Option<usize>,
     shift: usize,
     query: String,
-    results: Vec<(&'ctx Id, &'ctx [String], usize)>,
+    results: Vec<SearchResult<'ctx>>,
 }
 
 impl<'ctx> SearchMode<'ctx> {
-    const INPUT_PREFIX: &'static str = "search => ";
+    const INPUT_PREFIX: &'static str = "search \u{2192} ";
+    const INPUT_PREFIX_LEN: usize = str_char_count(Self::INPUT_PREFIX);
 
     fn new(query: String, ctx: &'ctx Ctx) -> Self {
         Self {
             query,
             selected: None,
             shift: 0,
-            results: Vec::with_capacity(ctx.docs.paths.len()),
+            results: Vec::with_capacity(ctx.docs.index.len()),
         }
     }
 
     fn print_results(&self, ctx: &'ctx Ctx, out: &mut impl Write) -> Result {
         let n = ctx.window_height - 4;
-        for (i, (_, segments, _)) in self.results.iter().enumerate().skip(self.shift)
-            .take(n as _) {
+
+        for (i, result) in self.results.iter().enumerate().skip(self.shift).take(n as _) {
             out.queue(MoveToColumn(0))?.queue(MoveToNextLine(1))?;
             let invert = if self.selected == Some(i) {INVERT} else {""};
-            match segments {
-                [] => {},
-                [segment] => write!(out, "{invert}{i}: {segment}{NOSTYLE}", i = i + 1)?,
-                [first, rest @..] => {
-                    write!(out, "{invert}{i}: {first}", i = i + 1)?;
-                    for segment in rest {
-                        write!(out, "::{segment}")?;
-                    }
-                    write!(out, "{NOSTYLE}")?;
-                }
-            }
+            write!(out, "{invert}{i}: {}{NOSTYLE}", result.id.0)?;
         }
+
         let n_advanced = self.results.len().try_into().unwrap_or(n).min(n);
         if n_advanced > 0 {
             out.queue(MoveToPreviousLine(n_advanced))?;
         }
-        out.queue(MoveToColumn((Self::INPUT_PREFIX.len() + self.query.len()).try_into()?))?;
+        out.queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.query.len()).try_into()?))?;
         OK
     }
 
     fn init(&self, ctx: &'ctx Ctx, out: &mut impl Write) -> Result {
         write!(out, "{BOLD}<Up/Down>{NOSTYLE} - go 1 line up/down in the results{NL}")?;
         write!(out, "{BOLD}<Ctrl-Up/Down>{NOSTYLE} - go to the top/bottom of the results{NL}")?;
-        write!(out, "search => {}", self.query)?;
+        write!(out, "{}{}", Self::INPUT_PREFIX, self.query)?;
         self.print_results(ctx, out)
-    }
-
-    fn get_results(&mut self, docs: &'ctx Docs) {
-        self.results.clear();
-        for (id, item) in &docs.paths {
-            let distance = item.path.iter()
-                .map(|segment| levenshtein(segment, &self.query))
-                .min()
-                .unwrap_or(usize::MAX);
-            let place = self.results.binary_search_by_key(&distance, |(.., d)| *d)
-                .unwrap_or_else(identity);
-            self.results.insert(place, (id, &item.path, distance));
-        }
     }
 
     fn process_key_event(&mut self, event: &KeyEvent, ctx: &'ctx Ctx, out: &mut impl Write)
@@ -187,7 +171,7 @@ impl<'ctx> SearchMode<'ctx> {
 
             KeyCode::Enter => if let Some(selected) = self.selected {
                 out.queue(MoveToPreviousLine(3))?.queue(Clear(FromCursorDown))?;
-                let docview = DocViewMode::new(self.results[selected].0, ctx)?;
+                let docview = DocViewMode::new(self.results[selected].id, ctx)?;
                 return Ok(Some(Mode::DocView(docview)))
             } else {
                 false
@@ -212,7 +196,7 @@ impl<'ctx> SearchMode<'ctx> {
         out.queue(Clear(FromCursorDown))?;
 
         if changed {
-            self.get_results(&ctx.docs);
+            ctx.docs.search(&self.query, &mut self.results);
         }
         self.print_results(ctx, out)?;
         Ok(None)
@@ -225,15 +209,16 @@ struct DocViewMode {
 }
 
 impl DocViewMode {
-    const INPUT_PREFIX: &'static str = "view => ";
+    const INPUT_PREFIX: &'static str = "view \u{2192} ";
+    const INPUT_PREFIX_LEN: usize = str_char_count(Self::INPUT_PREFIX);
 
     fn get_view(id: &Id, ctx: &Ctx) -> Result<Option<StringView>> {
         let Some(item) = ctx.docs.index.get(id) else {
             return Ok(None);
         };
-        let mut content = Vec::new();
-        print_item(item, &mut content)?;
-        Ok(Some(StringView::new(String::from_utf8(content)?, -1, -1)))
+        let mut content = StringView::new(String::new(), -1, -1);
+        print_item(item, &ctx.docs, &mut content)?;
+        Ok(Some(content))
     }
 
     fn new(id: &Id, ctx: &Ctx) -> Result<Self> {
@@ -241,7 +226,7 @@ impl DocViewMode {
     }
 
     fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        write!(out, "view => {}{NL}", self.id.0)?;
+        write!(out, "{}{}{NL}", Self::INPUT_PREFIX, self.id.0)?;
         if let Some(view) = &self.view {
             view.print(out)?;
         } else {
@@ -249,7 +234,7 @@ impl DocViewMode {
         }
         out.queue(MoveToRow(u16::MAX - 1))?
             .queue(MoveToPreviousLine(ctx.window_height - 2))?
-            .queue(MoveToColumn((Self::INPUT_PREFIX.len() + self.id.0.len()).try_into()?))?;
+            .queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.id.0.len()).try_into()?))?;
         OK
     }
 
@@ -262,7 +247,7 @@ impl DocViewMode {
         }
         out.queue(MoveToRow(u16::MAX - 1))?
             .queue(MoveToPreviousLine(ctx.window_height - 2))?
-            .queue(MoveToColumn((Self::INPUT_PREFIX.len() + self.id.0.len()).try_into()?))?;
+            .queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.id.0.len()).try_into()?))?;
         OK
     }
 
@@ -337,7 +322,7 @@ impl<'ctx> Mode<'ctx> {
 
 fn print_modes<'ctx>(
     modes: impl IntoIterator<IntoIter = impl DoubleEndedIterator<Item = &'ctx Mode<'ctx>>>,
-    out: &mut impl Write
+    out: &mut impl Write,
 ) -> Result {
     write!(out, "{BOLD}Mode{NOSTYLE}: ")?;
     for mode in modes.into_iter().rev() {
@@ -347,15 +332,18 @@ fn print_modes<'ctx>(
     OK
 }
 
-fn main_inner(r#in: &mut impl BufRead, out: &mut (impl Write + IsTerminal)) -> Result {
-    let ctx = Ctx::new(r#in, out)?;
+async fn main_inner(
+    r#in: &mut (impl BufRead + Send),
+    mut out: &mut (impl Write + Send),
+) -> Result {
+    let ctx = Ctx::new(r#in, out).await?;
     enable_raw_mode()?;
     out.queue(ScrollUp(ctx.window_height))?
         .queue(MoveToPreviousLine(ctx.window_height))?;
     write!(out, "{BOLD}Shrimple{NOSTYLE} documentation v{}{NL}", env!("CARGO_PKG_VERSION"))?;
     let mut modes = vec![Mode::Search(SearchMode::new(String::new(), &ctx))];
-    print_modes(&modes, out)?;
-    modes[0].init(&ctx, out)?;
+    print_modes(&modes, &mut out)?;
+    modes[0].init(&ctx, &mut out)?;
     out.flush()?;
 
     loop {
@@ -365,19 +353,19 @@ fn main_inner(r#in: &mut impl BufRead, out: &mut (impl Write + IsTerminal)) -> R
             out.queue(MoveToRow(u16::MAX - 1))?
                 .queue(MoveToPreviousLine(ctx.window_height - 1))?
                 .queue(Clear(FromCursorDown))?;
-            print_modes(&modes, out)?;
+            print_modes(&modes, &mut out)?;
             let mode = modes.last_mut().ok_or_else(|| anyhow!(Exit))?;
-            mode.init(&ctx, out)?;
-            mode.process_key_event(&NULL_EVENT, &ctx, out)?;
+            mode.init(&ctx, &mut out)?;
+            mode.process_key_event(&NULL_EVENT, &ctx, &mut out)?;
         } else if let Some(mut new_mode) = modes.last_mut().context("bug: no mode")?
-            .process_key_event(&event, &ctx, out)?
+            .process_key_event(&event, &ctx, &mut out)?
         {
             out.queue(MoveToRow(u16::MAX - 1))?
                 .queue(MoveToPreviousLine(ctx.window_height - 1))?
                 .queue(Clear(FromCursorDown))?;
-            print_modes(modes.iter().chain(once(&new_mode)), out)?;
-            new_mode.init(&ctx, out)?;
-            new_mode.process_key_event(&NULL_EVENT, &ctx, out)?;
+            print_modes(modes.iter().chain(once(&new_mode)), &mut out)?;
+            new_mode.init(&ctx, &mut out)?;
+            new_mode.process_key_event(&NULL_EVENT, &ctx, &mut out)?;
             modes.push(new_mode);
         }
         out.flush()?;
@@ -385,11 +373,12 @@ fn main_inner(r#in: &mut impl BufRead, out: &mut (impl Write + IsTerminal)) -> R
     }
 }
 
-fn main() -> Result {
+#[tokio::main]
+async fn main() -> Result {
     let mut stdout = stdout();
     let mut stdin = BufReader::new(stdin());
     stdout.execute(DisableLineWrap).inspect_err(|_| _ = disable_raw_mode())?;
-    let res = main_inner(&mut stdin, &mut stdout);
+    let res = main_inner(&mut stdin, &mut stdout).await;
     stdout.execute(EnableLineWrap)?;
     disable_raw_mode()?;
     res

@@ -1,5 +1,10 @@
 use std::{
-    cmp::Ordering, fmt::{Debug, Display, Formatter, Write}, io::{BufRead, BufReader, Lines, Read}, ops::Deref, ptr::copy_nonoverlapping, slice::{self, from_raw_parts}, str::from_utf8_unchecked
+    cmp::Ordering,
+    fmt::{Debug, Display, Formatter, Write},
+    ops::Deref,
+    ptr::copy_nonoverlapping,
+    slice,
+    str::from_utf8_unchecked,
 };
 
 use crossterm::{QueueableCommand, cursor::MoveToPreviousLine, event::{KeyCode, KeyEvent, KeyModifiers}};
@@ -15,43 +20,6 @@ pub const NL: &str = "\x1b[1E\x1b[0G";
 pub const CLEARLINE: &str = "\x1b[2K\r";
 pub const NULL_EVENT: KeyEvent = KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
 
-pub trait StrExt {
-    /// Extends the start of the string by `n` bytes, lengthening the string by the same `n` bytes.
-    /// Safety:
-    /// - Memory spanned by the resulting string must belong to the same allocation;
-    /// - Bytes in the newly gained memory span must be valid UTF-8;
-    /// - Adding `n` to the string's length must not overflow it.
-    unsafe fn stretch_left(&self, n: usize) -> &Self;
-}
-
-impl StrExt for str {
-    unsafe fn stretch_left(&self, n: usize) -> &Self {
-        from_utf8_unchecked(from_raw_parts(
-            self.as_ptr().sub(n),
-            self.len().wrapping_add(n),
-        ))
-    }
-}
-
-pub trait StringExt: Sized {
-    /// Truncates the string so that it matches the view of itself returned by `f`.
-    /// If the view overflows the string in either direction, the string is left unchanged in that
-    /// direction.
-    /// Forwards the error returned from `f`.
-    fn try_map<E>(self, f: impl FnOnce(&str) -> Result<&str, E>) -> Result<Self, E>;
-}
-
-impl StringExt for String {
-    fn try_map<E>(mut self, f: impl FnOnce(&str) -> Result<&str, E>) -> Result<Self, E> {
-        let res = f(&self)?;
-        let start = usize::saturating_sub(res.as_ptr() as _, self.as_ptr() as _);
-        let len = res.len();
-        self.drain(..start);
-        self.truncate(len);
-        Ok(self)
-    }
-}
-
 pub trait BoolExt {
     fn pick<T>(self, on_true: T, on_false: T) -> T;
 }
@@ -61,14 +29,6 @@ impl BoolExt for bool {
         if self {on_true} else {on_false}
     }
 }
-
-pub trait ReadExt: Read + Sized {
-    fn buffered_lines(self) -> Lines<BufReader<Self>> {
-        BufReader::new(self).lines()
-    }
-}
-
-impl<T: Read> ReadExt for T {}
 
 /**
  * `levenshtein-rs` - levenshtein
@@ -140,26 +100,48 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 
 #[derive(Debug)]
 pub struct StringView {
-    content: String,
-    min_shift:  isize,
-    max_shift:  isize,
-    min_scroll: isize,
-    max_scroll: isize,
-    scroll: isize,
-    shift: isize,
+    content:       String,
+    last_line_len: isize,
+    min_shift:     isize,
+    max_shift:     isize,
+    min_scroll:    isize,
+    max_scroll:    isize,
+    scroll:        isize,
+    shift:         isize,
+}
+
+impl Write for StringView {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.content.push_str(s);
+        for line in s.split_inclusive('\n') {
+            if line.ends_with('\n') {
+                let len = line.len().try_into().unwrap_or(isize::MAX);
+                self.max_shift = self.max_shift.max(self.last_line_len + len);
+                self.last_line_len = 0;
+                self.max_scroll += 1;
+            } else {
+                self.last_line_len = line.len().try_into().unwrap_or(isize::MAX);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StringView {
     pub fn new(content: String, min_shift: isize, min_scroll: isize) -> Self {
         let mut max_scroll = 0;
+        let mut last_line_len = 0isize;
         let max_shift = content.lines()
-            .inspect(|_| max_scroll += 1)
+            .inspect(|line| {
+                max_scroll += 1;
+                last_line_len = line.len().try_into().unwrap_or(isize::MAX);
+            })
             .map(str::len)
             .max()
             .map_or(0, |x| x.try_into().unwrap_or(isize::MAX));
         Self {
-            content, min_shift, max_shift, min_scroll, max_scroll,
-            scroll: min_scroll, shift: min_shift,
+            content, min_shift, max_shift, min_scroll, max_scroll, last_line_len,
+            scroll: min_scroll, shift: min_shift, 
         }
     }
 
@@ -338,4 +320,15 @@ impl<const CAP: usize> ShortStr<CAP> {
         // write `&str`s to it.
         unsafe { from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize)) }
     }
+}
+
+pub const fn str_char_count(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let [mut res, mut i] = [0, 0];
+    while i < len {
+        res += (bytes[i].leading_ones() != 1) as usize;
+        i += 1;
+    }
+    res
 }
