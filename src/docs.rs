@@ -1,6 +1,6 @@
 use std::{collections::HashMap, convert::identity, ffi::OsStr, fs::File, io::{BufRead, Write}, ops::Range, path::{Path, PathBuf}, process::Stdio, ptr::{addr_of, addr_of_mut}, sync::Arc};
 use anyhow::{bail, Context};
-use rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemSummary, Type, FORMAT_VERSION};
+use rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION};
 use serde::Deserialize;
 use tokio::{process::Command, task::JoinSet, try_join};
 use crate::{
@@ -77,7 +77,30 @@ impl VisitorMut for IdNormaliser<'_> {
     #[allow(clippy::cast_possible_wrap)]
     fn visit_id(&mut self, x: &mut Id) -> Result {
         if let Some(item) = self.paths.get(x) {
-            *x = Id(item.path.join("::"));
+            x.0.clear();
+            x.0.push_str(match item.kind {
+                ItemKind::Module if item.path.len() == 1 => "crate ",
+                ItemKind::Module => "mod ",
+                ItemKind::ExternCrate => "crate ",
+                ItemKind::Struct => "struct ",
+                ItemKind::Union => "union",
+                ItemKind::Enum => "enum ",
+                ItemKind::Function => "fn ",
+                ItemKind::TraitAlias | ItemKind::Trait => "trait ",
+                ItemKind::Static => "static ",
+                ItemKind::Macro => "macro ",
+                ItemKind::ProcAttribute => "attr ",
+                ItemKind::ProcDerive => "derive ",
+                ItemKind::AssocConst | ItemKind::Constant => "const ",
+                ItemKind::AssocType | ItemKind::TypeAlias => "type ",
+                ItemKind::Keyword => "keyword ",
+                _ => "$:",
+            });
+            let Some((first, rest)) = item.path.split_first() else {
+                return OK;
+            };
+            x.0.push_str(first);
+            x.0.extend(rest.iter().flat_map(|x| ["::", x]));
         } else {
             let init_off = matches!(x.0.as_bytes(), [b'a' | b'b', b':', ..]).pick(2, 0);
             let mut off = init_off;
@@ -307,8 +330,11 @@ impl Docs {
 
     pub fn search<'docs>(&'docs self, term: &str, dst: &mut Vec<SearchResult<'docs>>) {
         dst.clear();
+        let (item_kind, term) = term.split_once(' ').unwrap_or(("", term));
         for id in self.index.keys() {
-            if matches!(id.0.as_bytes(), [b'a' | b'b' | b'$', b':', ..]) {
+            if matches!(id.0.as_bytes(), [b'a' | b'b' | b'$', b':', ..])
+                || !id.0.starts_with(item_kind)
+            {
                 continue;
             }
             let distance = levenshtein(term, id.0.rsplit_once(':').map_or(&id.0, |x| x.1));

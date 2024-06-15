@@ -176,7 +176,7 @@ impl<'ctx> SearchMode<'ctx> {
                 false
             }
 
-            KeyCode::Char(ch) if !ch.is_whitespace() => {
+            KeyCode::Char(ch) if ch != '\n' => {
                 self.query.push(ch);
                 write!(out, "{ch}")?;
                 true
@@ -265,7 +265,7 @@ impl DocViewMode {
                 true
             }
 
-            KeyCode::Char(ch) if !ch.is_whitespace() => {
+            KeyCode::Char(ch) if ch != '\n' => {
                 self.id.0.push(ch);
                 write!(out, "{ch}")?;
                 true
