@@ -60,20 +60,19 @@ impl Ctx {
             writeln!(out, "It appears that you don't have a nightly Rust toolchain installed.")?;
             writeln!(out, "A nightly toolchain is essential for this tool to function.")?;
             writeln!(out, "Do you wish to install it?")?;
-            writeln!(out, "Answer (y/n, anything else will abort the program): ")?;
+            write  !(out, "Answer (y/n, anything else will abort the program): ")?;
             out.flush()?;
 
             let mut resp = [0u8; 2];
             r#in.read_exact(&mut resp)?;
-            let install_nightly = match &resp {
-                b"y\n" => true,
-                b"n\n" => false,
+            match &resp {
+                b"y\n" => {}
+                b"n\n" => bail!(Exit),
                 _ => bail!(EmptyError),
             };
-            ensure!(install_nightly, EmptyError);
 
             let status = Command::new("rustup")
-                .args(["toolchain", "install", "nightly"])
+                .args(["toolchain", "install", "nightly", "--component", "rust-docs-json"])
                 .stderr(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()
@@ -84,7 +83,7 @@ impl Ctx {
         };
 
         Ok(Self{
-            docs: Docs::new(&Arc::from(toolchain), out).await?,
+            docs: Docs::new(&Arc::from(toolchain), r#in, out).await?,
             window_height: Self::DEFAULT_WINHEIGHT,
         })
     }

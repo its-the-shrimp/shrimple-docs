@@ -2,9 +2,13 @@ use std::{fmt::{Display, Write}, mem::take};
 
 use anyhow::{bail, Context};
 use rustdoc_types::{
-    Abi, Constant, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Import, Item, ItemEnum, MacroKind, Path, PolyTrait, ProcMacro, Static, Struct, StructKind, Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind, Union, VariantKind, Visibility, WherePredicate
+    Abi, Constant, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Import, Item, ItemEnum, MacroKind, Path, PolyTrait, Primitive, ProcMacro, Static, Struct, StructKind, Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind, Union, VariantKind, Visibility, WherePredicate
 };
-use crate::{docs::{Docs, Infer}, item_visitor::{visit_type, Visitor}, utils::{BoolExt, Result, OK}};
+use crate::{
+    docs::{Docs, Infer},
+    item_visitor::{visit_type, Visitor},
+    utils::{BoolExt, Result, OK, BOLD, NOSTYLE},
+};
 
 struct Formatter<W>(W);
 
@@ -144,6 +148,7 @@ impl<W: Write> Visitor for Formatter<W> {
                 visit_type(self, x)?;
             }
 
+            Type::Primitive(t) if t == "never" => self.0.write_char('!')?,
             Type::Generic(t) | Type::Primitive(t) => write!(self.0, "{t}")?,
 
             Type::Tuple(types) => {
@@ -655,7 +660,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
             }
         }
 
-        ItemEnum::Primitive(_) => todo!(),
+        ItemEnum::Primitive(Primitive { name, .. }) => write!(fmt.0, "{BOLD}{name}{NOSTYLE}")?,
 
         ItemEnum::AssocConst { type_, default } => {
             let name = item.name.as_ref().context("no associated constant name")?;
