@@ -1,13 +1,26 @@
-use std::{collections::HashMap, convert::identity, ffi::OsStr, fs::File, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::Stdio, ptr::{addr_of, addr_of_mut}, sync::Arc, time::Instant};
-use anyhow::{bail, Context};
-use rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION};
-use serde::Deserialize;
-use tokio::{process::Command, task::JoinSet, try_join};
-use crate::{
-    item_visitor::VisitorMut,
-    utils::{levenshtein, BoolExt, EmptyError, Result, BOLD, CLEARLINE, GREEN, NOSTYLE, OK}
+use {
+    std::{
+        collections::HashMap,
+        convert::identity,
+        ffi::OsStr,
+        fs::File,
+        io::{BufRead, BufReader, Write},
+        path::{Path, PathBuf},
+        process::Stdio,
+        ptr::{addr_of, addr_of_mut},
+        sync::Arc,
+        time::Instant,
+    },
+    anyhow::{bail, Context},
+    rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
+    serde::Deserialize,
+    tokio::{process::Command, task::JoinSet, try_join},
+    crossterm::{cursor::MoveToPreviousLine, ExecutableCommand},
+    crate::{
+        item_visitor::VisitorMut,
+        utils::{levenshtein, BoolExt, EmptyError, Result, BOLD, CLEARLINE, GREEN, NOSTYLE, OK},
+    },
 };
-use crossterm::{cursor::MoveToPreviousLine, ExecutableCommand};
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
 pub type FnArg = (String, Type);

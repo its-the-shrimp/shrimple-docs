@@ -1,12 +1,18 @@
-use std::{
-    cmp::Ordering,
-    fmt::{Debug, Display, Formatter, Write},
-    ops::Deref,
-    ptr::copy_nonoverlapping,
-    slice,
-    str::from_utf8_unchecked,
+use {
+    std::{
+        cmp::Ordering,
+        fmt::{Debug, Display, Formatter, Write},
+        ops::Deref,
+        ptr::copy_nonoverlapping,
+        slice,
+        str::from_utf8_unchecked,
+    },
+    crossterm::{
+        QueueableCommand,
+        cursor::MoveToPreviousLine,
+        event::{KeyCode, KeyEvent, KeyModifiers},
+    },
 };
-use crossterm::{QueueableCommand, cursor::MoveToPreviousLine, event::{KeyCode, KeyEvent, KeyModifiers}};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 pub const OK: Result = Ok(());

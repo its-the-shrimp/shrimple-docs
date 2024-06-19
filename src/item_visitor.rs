@@ -1,14 +1,54 @@
 #![allow(dead_code, clippy::manual_flatten, clippy::for_kv_map)]
 
-use paste::paste;
-use rustdoc_types::{
-    Abi, Constant, Deprecation, Discriminant, DynTrait, Enum, ExternalCrate, FnDecl, Function,
-    FunctionPointer, GenericArg, GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind,
-    Generics, Header, Id, Impl, Import, Item, ItemEnum, Module, OpaqueTy, Path, PolyTrait,
-    Primitive, ProcMacro, Static, Struct, StructKind, Term, Trait, TraitAlias, Type, TypeAlias,
-    TypeBinding, TypeBindingKind, Union, Variant, VariantKind, Visibility, WherePredicate
+use {
+    paste::paste,
+    rustdoc_types::{
+        Abi,
+		Constant,
+		Deprecation,
+		Discriminant,
+		DynTrait,
+		Enum,
+		ExternalCrate,
+		FnDecl,
+		Function,
+        FunctionPointer,
+		GenericArg,
+		GenericArgs,
+		GenericBound,
+		GenericParamDef,
+		GenericParamDefKind,
+        Generics,
+		Header,
+		Id,
+		Impl,
+		Import,
+		Item,
+		ItemEnum,
+		Module,
+		OpaqueTy,
+		Path,
+		PolyTrait,
+        Primitive,
+		ProcMacro,
+		Static,
+		Struct,
+		StructKind,
+		Term,
+		Trait,
+		TraitAlias,
+		Type,
+		TypeAlias,
+        TypeBinding,
+		TypeBindingKind,
+		Union,
+		Variant,
+		VariantKind,
+		Visibility,
+		WherePredicate,
+    },
+    crate::{docs::{FnArg, Infer, Lifetime}, utils::{Result, OK}},
 };
-use crate::{docs::{FnArg, Infer, Lifetime}, utils::{Result, OK}};
 
 macro_rules! func {
     {

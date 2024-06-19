@@ -1,28 +1,50 @@
 mod utils;
-mod rust_format;
+mod item_printer;
 mod docs;
 mod item_visitor;
 
-use anyhow::{anyhow, bail, ensure, Context};
-use crossterm::{
-    cursor::{MoveLeft, MoveToColumn, MoveToNextLine, MoveToPreviousLine, MoveToRow},
-    event::{Event, KeyCode, KeyEvent, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType::FromCursorDown, DisableLineWrap, EnableLineWrap, ScrollUp},
-    ExecutableCommand,
-    QueueableCommand,
+use {
+    anyhow::{anyhow, bail, ensure, Context},
+    crossterm::{
+        cursor::{MoveLeft, MoveToColumn, MoveToNextLine, MoveToPreviousLine, MoveToRow},
+        event::{Event, KeyCode, KeyEvent, KeyModifiers},
+        terminal::{
+            disable_raw_mode,
+            enable_raw_mode,
+            Clear,
+            ClearType::FromCursorDown,
+            DisableLineWrap,
+            EnableLineWrap,
+            ScrollUp,
+        },
+        ExecutableCommand,
+        QueueableCommand,
+    },
+    docs::{Docs, SearchResult},
+    rustdoc_types::Id,
+    std::{
+        io::{stdin, stdout, BufRead, BufReader, Write},
+        iter::once,
+        process::{Command, Stdio},
+        sync::Arc,
+    },
+    crate::{
+        item_printer::print_item,
+        utils::{
+            str_char_count,
+            EmptyError,
+            Exit,
+            StringView,
+            INVERT,
+            OK,
+            Result,
+            NL,
+            NULL_EVENT,
+            NOSTYLE,
+            BOLD,
+        },
+    },
 };
-use docs::{Docs, SearchResult};
-use rust_format::print_item;
-use rustdoc_types::Id;
-use utils::{str_char_count, EmptyError, Exit, StringView, INVERT, OK};
-use std::{
-    io::{stdin, stdout, BufRead, BufReader, Write},
-    iter::once,
-    process::{Command, Stdio},
-    sync::Arc,
-};
-
-use crate::utils::{Result, NL, NULL_EVENT, NOSTYLE, BOLD};
 
 /// if `None` is returned, the app is supposed to exit.
 fn next_key_event() -> Result<KeyEvent> {

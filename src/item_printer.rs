@@ -1,13 +1,48 @@
-use std::{fmt::{Display, Write}, mem::take};
-
-use anyhow::{bail, Context};
-use rustdoc_types::{
-    Abi, Constant, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArgs, GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Import, Item, ItemEnum, MacroKind, Path, PolyTrait, Primitive, ProcMacro, Static, Struct, StructKind, Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind, Union, VariantKind, Visibility, WherePredicate
-};
-use crate::{
-    docs::{Docs, Infer},
-    item_visitor::{visit_type, Visitor},
-    utils::{BoolExt, Result, OK, BOLD, NOSTYLE},
+use {
+    std::{fmt::{Display, Write}, mem::take},
+    anyhow::{bail, Context},
+    rustdoc_types::{
+        Abi,
+        Constant,
+		DynTrait,
+		Enum,
+		FnDecl,
+		Function,
+		FunctionPointer,
+		GenericArgs,
+		GenericBound,
+		GenericParamDef,
+		GenericParamDefKind,
+		Generics,
+		Header,
+		Import,
+		Item,
+		ItemEnum,
+		MacroKind,
+		Path,
+		PolyTrait,
+		Primitive,
+		ProcMacro,
+		Static,
+		Struct,
+		StructKind,
+		Trait,
+		TraitAlias,
+		TraitBoundModifier,
+		Type,
+		TypeAlias,
+		TypeBinding,
+		TypeBindingKind,
+		Union,
+		VariantKind,
+		Visibility,
+		WherePredicate,
+    },
+    crate::{
+        docs::{Docs, Infer},
+        item_visitor::{visit_type, Visitor},
+        utils::{BoolExt, Result, OK, BOLD, NOSTYLE},
+    },
 };
 
 struct Formatter<W>(W);
@@ -50,8 +85,6 @@ impl<W: Write> Formatter<W> {
         OK
     }
 
-    /// Unlike the `RustFormat` impl on `Generics`, this allows to do anything between printing the
-    /// parameters and the `where` predicates.
     fn print_generics<E: Into<anyhow::Error>>(
         &mut self,
         item: &Generics,
