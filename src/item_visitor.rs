@@ -53,7 +53,7 @@ macro_rules! func {
 func! {
     for Abi: |_, _| -> {}
 
-    for Constant: |v, Constant { type_, .. }| -> v.visit_type(type_)?
+    for Constant: |_, _| -> {}
 
     for Deprecation: |_, _| -> {}
 
@@ -208,7 +208,10 @@ func! {
             ItemEnum::Impl(x) => v.visit_impl(x)?,
             ItemEnum::TypeAlias(x) => v.visit_type_alias(x)?,
             ItemEnum::OpaqueTy(x) => v.visit_opaque_ty(x)?,
-            ItemEnum::Constant(x) => v.visit_constant(x)?,
+            ItemEnum::Constant { type_, const_ } => {
+                v.visit_type(type_)?;
+                v.visit_constant(const_)?;
+            }
             ItemEnum::Static(x) => v.visit_static(x)?,
             ItemEnum::ProcMacro(x) => v.visit_proc_macro(x)?,
             ItemEnum::Primitive(x) => v.visit_primitive(x)?,

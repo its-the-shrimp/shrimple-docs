@@ -6,7 +6,6 @@ use std::{
     slice,
     str::from_utf8_unchecked,
 };
-
 use crossterm::{QueueableCommand, cursor::MoveToPreviousLine, event::{KeyCode, KeyEvent, KeyModifiers}};
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;

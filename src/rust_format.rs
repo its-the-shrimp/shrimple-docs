@@ -610,12 +610,12 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
 
         ItemEnum::OpaqueTy(_) => todo!(),
 
-        ItemEnum::Constant(r#const) => {
+        ItemEnum::Constant { type_, const_ } => {
             let name = item.name.as_ref().context("no constant name")?;
             write!(fmt.0, "const {name}: ")?;
-            fmt.visit_type(&r#const.type_)?;
+            fmt.visit_type(type_)?;
             write!(fmt.0, " = ")?;
-            fmt.visit_constant(r#const)?;
+            fmt.visit_constant(const_)?;
         }
 
         ItemEnum::Static(Static { type_, mutable, .. }) => {

@@ -18,7 +18,8 @@ use utils::{str_char_count, EmptyError, Exit, StringView, INVERT, OK};
 use std::{
     io::{stdin, stdout, BufRead, BufReader, Write},
     iter::once,
-    process::{Command, Stdio}, sync::Arc,
+    process::{Command, Stdio},
+    sync::Arc,
 };
 
 use crate::utils::{Result, NL, NULL_EVENT, NOSTYLE, BOLD};
@@ -372,7 +373,7 @@ async fn main_inner(
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result {
     let mut stdout = stdout();
     let mut stdin = BufReader::new(stdin());

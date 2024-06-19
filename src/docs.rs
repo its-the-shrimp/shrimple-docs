@@ -1,11 +1,11 @@
-use std::{collections::HashMap, convert::identity, ffi::OsStr, fs::File, io::{BufRead, Write}, ops::Range, path::{Path, PathBuf}, process::Stdio, ptr::{addr_of, addr_of_mut}, sync::Arc};
+use std::{collections::HashMap, convert::identity, ffi::OsStr, fs::File, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::Stdio, ptr::{addr_of, addr_of_mut}, sync::Arc, time::Instant};
 use anyhow::{bail, Context};
 use rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION};
 use serde::Deserialize;
 use tokio::{process::Command, task::JoinSet, try_join};
 use crate::{
     item_visitor::VisitorMut,
-    utils::{levenshtein, BoolExt, EmptyError, Result, BOLD, CLEARLINE, GREEN, NOSTYLE, OK},
+    utils::{levenshtein, BoolExt, EmptyError, Result, BOLD, CLEARLINE, GREEN, NOSTYLE, OK}
 };
 use crossterm::{cursor::MoveToPreviousLine, ExecutableCommand};
 
@@ -70,7 +70,7 @@ struct IdNormaliser<'docs> {
     paths: &'docs HashMap<Id, ItemSummary>,
     crate_name: &'docs str,
     crates: &'docs HashMap<u32, ExternalCrate>,
-    ranges_temp: Vec<(Range<usize>, &'docs str)>,
+    temp: String,
 }
 
 impl VisitorMut for IdNormaliser<'_> {
@@ -102,14 +102,16 @@ impl VisitorMut for IdNormaliser<'_> {
             x.0.push_str(first);
             x.0.extend(rest.iter().flat_map(|x| ["::", x]));
         } else {
-            let init_off = matches!(x.0.as_bytes(), [b'a' | b'b', b':', ..]).pick(2, 0);
-            let mut off = init_off;
-            for id in x.0[off..].split('-') {
-                let crate_id_str = id.split_once(':').map_or(id, |x| x.0);
+            let off = matches!(x.0.as_bytes(), [b'a' | b'b', b':', ..]).pick(2, 0);
+            if off == 0 {
+                self.temp.insert_str(0, "$:");
+            }
+            for id in x.0[off..].split_inclusive('-') {
+                let (crate_id_str, rest) = id.split_once(':').unwrap_or((id, ""));
                 let crate_id = crate_id_str
                     .parse()
                     .with_context(|| format!("item ID {:?} is malformatted", x.0))?;
-                let new_crate_name = match crate_id {
+                let crate_name = match crate_id {
                     0 => self.crate_name,
                     _ => self.crates.get(&crate_id)
                         .map(|x| &x.name)
@@ -117,26 +119,21 @@ impl VisitorMut for IdNormaliser<'_> {
                             format!("unknown crate ID: {crate_id_str:?}\n\tfull ID: {}", x.0)
                         })?
                 };
-                self.ranges_temp.push((off .. off + crate_id_str.len(), new_crate_name));
-                off += id.len() + 1;
+                self.temp.push_str(crate_name);
+                self.temp.push(':');
+                self.temp.push_str(rest);
             }
-
-            let mut off = 0isize;
-            for (mut range, new_crate_name) in self.ranges_temp.drain(..) {
-                range.start = range.start.wrapping_add_signed(off);
-                range.end = range.end.wrapping_add_signed(off);
-                x.0.replace_range(range.clone(), new_crate_name);
-                off += new_crate_name.len().wrapping_sub(range.end - range.start) as isize;
-            }
-            x.0.replace_range(..init_off, "$:");
+            x.0.clone_from(&self.temp);
+            self.temp.clear();
         }
         OK
     }
 }
 
-fn parse_json_docs(path: impl AsRef<Path>) -> Result<HashMap<Id, Item>> {
+// TODO: check why can't this Vec be an opaque iterable
+fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Id, Item)>> {
     let path = path.as_ref();
-    let docs: Crate = match serde_json::from_reader(File::open(path)?) {
+    let docs: Crate = match serde_json::from_reader(BufReader::new(File::open(path)?)) {
         Ok(x) => x,
         Err(e) => {
             #[derive(Deserialize)]
@@ -162,7 +159,7 @@ fn parse_json_docs(path: impl AsRef<Path>) -> Result<HashMap<Id, Item>> {
         crate_name: path.file_name().and_then(OsStr::to_str)
             .context("no crate name extracted from the path to the JSON file")?,
         crates: &docs.external_crates,
-        ranges_temp: Vec::with_capacity(2),
+        temp: String::new(),
     };
     
     docs.index.into_iter()
@@ -179,7 +176,7 @@ async fn document_crate(
     name: impl AsRef<str> + Send,
     manifest_path: impl AsRef<str> + Send,
     toolchain: impl AsRef<str> + Send,
-) -> Result<HashMap<Id, Item>> {
+) -> Result<impl IntoIterator<Item = (Id, Item)>> {
     let manifest_path = manifest_path.as_ref();
     let name = name.as_ref();
     let docs_gen = Command::new("rustup")
@@ -257,6 +254,7 @@ pub struct SearchResult<'docs> {
 }
 
 /// Aggregator of all the docs
+#[derive(Default)]
 pub struct Docs {
     pub index: HashMap<Id, Item>,
 }
@@ -267,7 +265,7 @@ impl Docs {
         r#in: &mut (impl BufRead + Send),
         out: &mut (impl Write + Send),
     ) -> Result<Self> {
-        let mut res = Self { index: HashMap::new() };
+        let mut res = Self::default();
 
         writeln!(out, "{GREEN}{BOLD}Extracting{NOSTYLE} crate & system metadata")?;
         let (packages, std_docs_dir) = try_join!(
@@ -303,6 +301,7 @@ impl Docs {
         }?;
         let n_libs = packages.len() + std_libs.len();
         let mut n_processed = 0usize;
+        let start = Instant::now();
         writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... 0 / {n_libs}")?;
 
         for file in std_libs {
@@ -325,6 +324,11 @@ impl Docs {
             writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
                          {n_processed} / {n_libs}")?;
         }
+
+        let duration = start.elapsed();
+        out.execute(MoveToPreviousLine(1))?;
+        writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
+                     finished in {:.2} seconds", duration.as_secs_f64())?;
         Ok(res)
     }
 
