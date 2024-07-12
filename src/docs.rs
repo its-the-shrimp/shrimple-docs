@@ -1,25 +1,35 @@
 use {
-    std::{
-        collections::HashMap,
-        convert::identity,
-        ffi::OsStr,
-        fs::File,
-        io::{BufRead, BufReader, Write},
-        path::{Path, PathBuf},
-        process::Stdio,
-        ptr::{addr_of, addr_of_mut},
-        sync::Arc,
-        time::Instant,
-    },
-    anyhow::{bail, Context},
-    rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
-    serde::Deserialize,
-    tokio::{process::Command, task::JoinSet, try_join},
-    crossterm::{cursor::MoveToPreviousLine, ExecutableCommand},
     crate::{
         item_visitor::VisitorMut,
-        utils::{levenshtein, BoolExt, EmptyError, Result, BOLD, CLEARLINE, GREEN, NOSTYLE, OK},
+        utils::{
+            BoolExt,
+            EmptyError,
+            Exit,
+            IteratorExt,
+            Result,
+            BOLD,
+            GREEN,
+            NOSTYLE,
+            OK,
+        }
     },
+    anyhow::{bail, ensure, Context},
+    rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
+    serde::Deserialize,
+    serde_json::Value,
+    std::{
+        collections::HashMap,
+        ffi::OsStr,
+        fs::File,
+        io::{BufRead, BufReader, Read, Write},
+        mem::take,
+        path::{Path, PathBuf},
+        process::{Output, Stdio},
+        ptr::{addr_of, addr_of_mut},
+        sync::Arc,
+        vec,
+    },
+    tokio::{process::Command, try_join},
 };
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
@@ -44,32 +54,33 @@ impl<'res> From<Infer> for &'res mut Infer {
 pub type Lifetime = String;
 
 #[derive(Debug, Deserialize)]
-pub struct Target<'src> {
-    pub name: &'src str,
-    pub kind: Vec<&'src str>,
+struct Dep<'src> {
+    #[serde(borrow)]
+    name: &'src str,
+    features: Vec<&'src str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Target<'src> {
+    name: &'src str,
+    kind: Vec<&'src str>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Package<'src> {
-    /// Changed to the lib name, or name with hyphens replaced with underscores
+    id: &'src str,
     name: String,
+    #[serde(default)]
+    metadata: Value,
     #[serde(borrow)]
     targets: Vec<Target<'src>>,
+    dependencies: Vec<Dep<'src>>,
     manifest_path: String,
 }
 
-impl<'src> Package<'src> {
-    /// Converting the lifetime to `'static` is safe since the `targets` vector is emptied.
-    fn normalise_name(self) -> Package<'static> {
-        Package {
-            name: self.targets
-                .iter()
-                .find(|t| t.kind.contains(&"lib"))
-                .map_or_else(|| self.name.replace('-', "_"), |t| t.name.into()),
-            targets: vec![],
-            manifest_path: self.manifest_path
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct Resolve<'src> {
+    root: &'src str,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +88,25 @@ impl<'src> Package<'src> {
 struct CargoMetadata<'src> {
     #[serde(borrow)]
     packages: Vec<Package<'src>>,
+    resolve: Resolve<'src>,
+    target_directory: PathBuf,
+}
+
+/// Created by processing [`CargoMetadata`]
+pub struct DocsGen {
+    packages: vec::IntoIter<Documentable>,
+    toolchain: Arc<str>,
+    target_directory: PathBuf,
+}
+
+impl DocsGen {
+    pub async fn document_next(&mut self, offline: bool)
+        -> Option<Result<(Vec<(Arc<str>, Item)>, Arc<str>)>>
+    {
+        let next = self.packages.next()?;
+        let name = next.name.clone();
+        Some(next.document(offline, &self.toolchain, &self.target_directory).await.map(|x| (x, name)))
+    }
 }
 
 struct IdNormaliser<'docs> {
@@ -87,7 +117,6 @@ struct IdNormaliser<'docs> {
 }
 
 impl VisitorMut for IdNormaliser<'_> {
-    #[allow(clippy::cast_possible_wrap)]
     fn visit_id(&mut self, x: &mut Id) -> Result {
         if let Some(item) = self.paths.get(x) {
             x.0.clear();
@@ -116,9 +145,7 @@ impl VisitorMut for IdNormaliser<'_> {
             x.0.extend(rest.iter().flat_map(|x| ["::", x]));
         } else {
             let off = matches!(x.0.as_bytes(), [b'a' | b'b', b':', ..]).pick(2, 0);
-            if off == 0 {
-                self.temp.insert_str(0, "$:");
-            }
+            self.temp.push_str("$:");
             for id in x.0[off..].split_inclusive('-') {
                 let (crate_id_str, rest) = id.split_once(':').unwrap_or((id, ""));
                 let crate_id = crate_id_str
@@ -143,8 +170,7 @@ impl VisitorMut for IdNormaliser<'_> {
     }
 }
 
-// TODO: check why can't this Vec be an opaque iterable
-fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Id, Item)>> {
+fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Arc<str>, Item)>> {
     let path = path.as_ref();
     let docs: Crate = match serde_json::from_reader(BufReader::new(File::open(path)?)) {
         Ok(x) => x,
@@ -176,69 +202,124 @@ fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Id, Item)>> {
     };
     
     docs.index.into_iter()
-        .filter(|(k, _)| k.0.starts_with("0:"))
         .map(|(mut k, mut item)| {
             id_normaliser.visit_id(&mut k)?;
             id_normaliser.visit_item(&mut item)?;
-            Ok((k, item))
+            Ok((k.0.into(), item))
         })
         .collect()
 }
 
-async fn document_crate(
-    name: impl AsRef<str> + Send,
-    manifest_path: impl AsRef<str> + Send,
-    toolchain: impl AsRef<str> + Send,
-) -> Result<impl IntoIterator<Item = (Id, Item)>> {
-    let manifest_path = manifest_path.as_ref();
-    let name = name.as_ref();
-    let docs_gen = Command::new("rustup")
-        .args([
-            "run",
-            toolchain.as_ref(),
-            "cargo",
-            "rustdoc",
-            //"--all-features",
-            "--manifest-path", manifest_path,
-            "--color", "always",
-            "-Zunstable-options",
-            "--output-format", "json",
-        ])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .output().await?;
-    if !docs_gen.status.success() {
-        bail!("`cargo rustdoc` failed; output:\n{}", String::from_utf8_lossy(&docs_gen.stderr));
-    }
-
-    let mut docs_path = Path::new(manifest_path)
-        .parent().context("invalid Cargo manifest path")?
-        .join("target/doc");
-    docs_path.push(name);
-    docs_path.set_extension("json");
-
-    parse_json_docs(&docs_path)
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+/// Value of `package.metadata.docs.rs` in a crate
+struct DocConfig {
+    features: Vec<String>,
+    rustdoc_args: Vec<String>,
+    cargo_args: Vec<String>,
+    rustc_args: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
 }
 
-async fn get_packages(toolchain: &str) -> Result<Vec<Package<'static>>> {
-    let cmd = Command::new("rustup")
-        .args([
-            "run",
-            toolchain,
-            "cargo",
-            "metadata",
-            "--format-version=1",
-        ])
+/// A package & its flags as given by the package for docs.rs
+struct Documentable {
+    // TODO: allow for documenting multiple crates defined by 1 package
+    name: Arc<str>,
+    manifest_path: String,
+    config: DocConfig,
+}
+
+impl TryFrom<Package<'_>> for Documentable {
+    type Error = anyhow::Error;
+
+    fn try_from(mut p: Package) -> Result<Self, Self::Error> {
+        let raw_config = take(&mut p.metadata["docs"]["rs"]);
+        let mut config = serde_json::from_value::<Option<DocConfig>>(raw_config)?
+                .unwrap_or_default();
+        config.rustdoc_args.retain(|a| !matches!(&**a, "--generate-link-to-definition"));
+        Ok(Self {
+            name: p.targets
+                .iter()
+                .find(|t| t.kind.contains(&"lib"))
+                .map_or_else(|| p.name.replace('-', "_").into(), |t| t.name.into()),
+            manifest_path: p.manifest_path,
+            config,
+        })
+    }
+}
+
+impl Documentable {
+    async fn document(
+        self,
+        offline: bool,
+        toolchain: impl AsRef<str> + Send,
+        target_directory: impl AsRef<Path> + Send,
+    ) -> Result<Vec<(Arc<str>, Item)>> {
+        let target_directory = target_directory.as_ref();
+        let mut cmd = Command::new("rustup");
+        cmd
+            .args(["run", toolchain.as_ref(), "cargo"])
+            .args(self.config.cargo_args)
+            .args(["rustdoc", "--verbose", "--manifest-path", &self.manifest_path, "--target-dir"])
+            .arg(target_directory)
+            .args(offline.then_some("--offline"))
+            .args(self.config.all_features.then_some("--all-features"))
+            .args(self.config.no_default_features.then_some("--no-default-features"))
+            .args(self.config.features.iter().flat_map(|f| ["-F", f]))
+            .args(["-Zunstable-options", "--output-format=json", "--", "--cfg", "docsrs"])
+            .args(self.config.rustdoc_args)
+            .env("DOCSRS", "")
+            .env("CARGO_ENCODED_RUSTFLAGS", self.config.rustc_args.join("\x1f"))
+            .stdout(Stdio::null());
+        let Output { status, stderr, .. } = cmd
+            .output().await
+            .context("failed to launch `rustup run cargo rustdoc`")?;
+        if !status.success() {
+            bail!("`cargo rustdoc` failed;\ncommand: {cmd:#?}\noutput:\n{}",
+                String::from_utf8_lossy(&stderr));
+        }
+
+        let mut docs_path = target_directory.join("doc");
+        docs_path.push(&*self.name);
+        docs_path.set_extension("json");
+
+        parse_json_docs(docs_path)
+    }
+}
+
+async fn get_gen_ctx(toolchain: Arc<str>) -> Result<DocsGen> {
+    let Output { status, stdout, .. } = Command::new("rustup")
+        .args(["run", &toolchain, "cargo", "metadata", "--format-version=1"])
         .stderr(Stdio::inherit())
         .output().await?;
-    if !cmd.status.success() {
-        bail!("`cargo metadata` failed");
+    ensure!(status.success(), "`cargo metadata` failed");
+
+    let mut metadata: CargoMetadata = serde_json::from_slice(&stdout)?;
+    let deps = metadata.packages.iter_mut()
+        .find(|x| x.id == metadata.resolve.root)
+        .map(|x| take(&mut x.dependencies))
+        .context("couldn't find the root package")?;
+    let mut packages: Vec<Documentable> = metadata.packages.into_iter()
+        .map(Documentable::try_from)
+        .try_collect()?;
+
+    for Dep { name, features } in deps {
+        if features.is_empty() { continue }
+    
+        let dep = packages.iter_mut().find(|x| &*x.name == name)
+            .with_context(|| format!("failed to unify dependency features: package {name:?} \
+                                      not found"))?;
+        if !dep.config.all_features {
+            dep.config.features.extend(features.into_iter().map(Into::into));
+        }
     }
-    let CargoMetadata { packages } = serde_json::from_slice(&cmd.stdout)?;
-    // TODO: sort & collect simultaneously?
-    let mut packages: Vec<_> = packages.into_iter().map(Package::normalise_name).collect();
-    packages.sort_unstable_by(|p1, p2| p1.name.cmp(&p2.name));
-    Ok(packages)
+
+    Ok(DocsGen {
+        packages: packages.into_iter(),
+        toolchain,
+        target_directory: metadata.target_directory,
+    })
 }
 
 async fn get_std_docs_dir(toolchain: &str) -> Result<PathBuf> {
@@ -259,105 +340,185 @@ async fn get_std_docs_dir(toolchain: &str) -> Result<PathBuf> {
 }
 
 /// Filled in by [`Docs::search`]
-pub struct SearchResult<'docs> {
-    /// [`Id`] usable to index the docs directly.
-    pub id: &'docs Id,
-    /// Levenshtein distance from the searched term.
-    pub distance: usize,
+pub struct SearchResult {
+    /// ID usable to index the docs directly.
+    pub id: Arc<str>,
+}
+
+async fn get_nightly_toolchain(r#in: &mut (impl Read + Send), out: &mut (impl Write + Send))
+    -> Result<Arc<str>>
+{
+    let toolchains = Command::new("rustup")
+        .args(["toolchain", "list"])
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .output().await?
+        .stdout;
+    let toolchains = String::from_utf8(toolchains).context("`rustup` gave non-UTF8 output")?;
+
+    Ok(if let Some(x) = toolchains.lines().rfind(|x| x.starts_with("nightly")) {
+        Arc::<str>::from(x.split_once(' ').map_or(x, |x| x.0))
+    } else {
+        writeln!(out, "It appears that you don't have a nightly Rust toolchain installed.")?;
+        writeln!(out, "A nightly toolchain is essential for this tool to function.")?;
+        writeln!(out, "Do you wish to install it?")?;
+        write  !(out, "Answer (y/n, anything else will abort the program): ")?;
+        out.flush()?;
+
+        let mut resp = [0u8; 2];
+        r#in.read_exact(&mut resp)?;
+        match &resp {
+            b"y\n" => {}
+            b"n\n" => bail!(Exit),
+            _ => bail!(EmptyError),
+        };
+
+        let status = Command::new("rustup")
+            .args(["toolchain", "install", "nightly", "--component", "rust-docs-json"])
+            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status().await
+            .context("failed to launch `rustup toolchain install nightly`")?;
+        ensure!(status.success(), "`rustup` failed");
+
+        Arc::from("nightly")
+    })
 }
 
 /// Aggregator of all the docs
-#[derive(Default)]
 pub struct Docs {
-    pub index: HashMap<Id, Item>,
+    fzf_input_path: Box<Path>,
+    index: HashMap<Arc<str>, Item>,
 }
 
 impl Docs {
     pub async fn new(
-        toolchain: &Arc<str>,
-        r#in: &mut (impl BufRead + Send),
+        r#in: &mut (impl Read + Send),
         out: &mut (impl Write + Send),
+        offline: bool,
     ) -> Result<Self> {
-        let mut res = Self::default();
+        let mut index = HashMap::new();
+        let toolchain = get_nightly_toolchain(r#in, out).await?;
 
-        writeln!(out, "{GREEN}{BOLD}Extracting{NOSTYLE} crate & system metadata")?;
-        let (packages, std_docs_dir) = try_join!(
-            get_packages(toolchain),
-            get_std_docs_dir(toolchain),
-        )?;
+        writeln!(out, "{GREEN}{BOLD}Extracting{NOSTYLE} crate and system metadata")?;
+        let (mut ctx, std_docs_dir) = try_join! {
+            get_gen_ctx(toolchain.clone()),
+            get_std_docs_dir(&toolchain),
+        }?;
 
-        let include_std_docs = std_docs_dir.try_exists()? || {
+        let include_std_docs = std_docs_dir.try_exists()? || 'install_docs: {
             writeln!(out, "Do you wish to install the docs for the standard library?")?;
             write  !(out, "Answer (y/n, anything else will abort the program): ")?;
             out.flush()?;
             let mut resp = [0u8; 2];
             r#in.read_exact(&mut resp)?;
             match &resp {
-                b"y\n" => true,
-                b"n\n" => false,
+                b"y\n" => {}
+                b"n\n" => break 'install_docs false,
                 _ => bail!(EmptyError),
             };
             if !Command::new("rustup")
-                .args(["run", toolchain, "rustup", "component", "add", "rust-docs-json"])
+                .args(["run", &toolchain, "rustup", "component", "add", "rust-docs-json"])
                 .status().await?
                 .success()
             {
-                bail!("`rustup run {toolchain} rustup component add rust-docs-json` failed");
+                bail!("`rustup component add rust-docs-json` failed");
             }
             true
         };
 
-        let std_libs: Vec<PathBuf> = if include_std_docs {
-            std_docs_dir.read_dir()?.map(|x| x.map(|x| x.path())).collect()
-        } else {
-            Ok(vec![])
-        }?;
-        let n_libs = packages.len() + std_libs.len();
-        let mut n_processed = 0usize;
-        let start = Instant::now();
-        writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... 0 / {n_libs}")?;
+        let fzf_input_path = ctx.target_directory.join(".fzfinput").into_boxed_path();
+        let mut fzf_input = File::create(&fzf_input_path)?;
 
-        for file in std_libs {
-            res.index.extend(parse_json_docs(file)?);
-            n_processed += 1;
-            out.execute(MoveToPreviousLine(1))?;
-            writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
-                         {n_processed} / {n_libs}")?;
+        if include_std_docs {
+            for entry in std_docs_dir.read_dir()? {
+                let file = entry?.path();
+                let name = Path::new(file.file_stem().context("no standard library name")?)
+                    .display();
+                writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} {name}")?;
+                let docs = parse_json_docs(file)?;
+                index.reserve(docs.len());
+                for (id, item) in docs {
+                    if id.bytes().nth(1) != Some(b':') {
+                        writeln!(fzf_input, "{id}")?;
+                    }
+                    index.insert(id, item);
+                }
+            }
         }
 
-        let mut documentors: JoinSet<_> = packages
-            .into_iter()
-            .map(|p| document_crate(p.name, p.manifest_path, toolchain.clone()))
-            .collect();
-
-        while let Some(items) = documentors.join_next().await {
-            res.index.extend(items??);
-            n_processed += 1;
-            out.execute(MoveToPreviousLine(1))?;
-            writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
-                         {n_processed} / {n_libs}")?;
+        while let Some(docs) = ctx.document_next(offline).await {
+            let (docs, name) = docs?;
+            writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} {name}")?;
+            index.reserve(docs.len());
+            for (id, item) in docs {
+                if id.bytes().nth(1) != Some(b':') {
+                    writeln!(fzf_input, "{id}")?;
+                }
+                index.insert(id, item);
+            }
         }
 
-        let duration = start.elapsed();
-        out.execute(MoveToPreviousLine(1))?;
-        writeln!(out, "{CLEARLINE}{GREEN}{BOLD}Documenting{NOSTYLE} libraries ... \
-                     finished in {:.2} seconds", duration.as_secs_f64())?;
-        Ok(res)
+        Ok(Self { fzf_input_path, index })
     }
 
-    pub fn search<'docs>(&'docs self, term: &str, dst: &mut Vec<SearchResult<'docs>>) {
+    pub const fn index(&self) -> &HashMap<Arc<str>, Item> {
+        &self.index
+    }
+
+    /// `term` is guaranteed to be unchanged, this is just an optimisation
+    pub fn search(&self, term: &mut String, dst: &mut Vec<SearchResult>) -> Result {
         dst.clear();
-        let (item_kind, term) = term.split_once(' ').unwrap_or(("", term));
-        for id in self.index.keys() {
-            if matches!(id.0.as_bytes(), [b'a' | b'b' | b'$', b':', ..])
-                || !id.0.starts_with(item_kind)
-            {
-                continue;
-            }
-            let distance = levenshtein(term, id.0.rsplit_once(':').map_or(&id.0, |x| x.1));
-            let place = dst.binary_search_by_key(&distance, |res| res.distance)
-                .unwrap_or_else(identity);
-            dst.insert(place, SearchResult { id, distance });
+
+        let item_kind_constrained = if term.is_empty() {
+            dst.extend(self.index.keys()
+                .filter(|x| x.bytes().nth(1) != Some(b':'))
+                .cloned()
+                .map(|id| SearchResult { id }));
+            return OK
+        } else if term.contains(' ') {
+            term.insert(0, '^');
+            true
+        } else {
+            false
+        };
+
+        let fzf = std::process::Command::new("fzf")
+            .args(["-f", term])
+            .stdin(File::open(&self.fzf_input_path)?)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        if item_kind_constrained {
+            term.remove(0);
         }
+
+        let mut fzf = fzf?;
+        let mut stdout = fzf.stdout.take()
+            .map(BufReader::new)
+            .context("failed to get the stdout of `fzf`")?;
+        let mut line = String::new();
+
+        if !fzf.wait()?.success() {
+            let mut err_msg = "`fzf` failed\nstderr:".to_owned();
+            if let Some(stderr) = &mut fzf.stderr {
+                err_msg.push('\n');
+                stderr.read_to_string(&mut err_msg)?;
+            } else {
+                err_msg.push_str(" <failed to get stderr>");
+            }
+            bail!(err_msg)
+        }
+
+        while stdout.read_line(&mut line)? > 0 {
+            let (id, _) = self.index
+                .get_key_value(line.trim_end_matches('\n'))
+                .with_context(|| format!("invalid otuput from `fzf`: item {line:?} not found"))?;
+            dst.push(SearchResult { id: id.clone() });
+            line.clear();
+        }
+
+        Ok(())
     }
 }

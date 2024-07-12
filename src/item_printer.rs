@@ -419,7 +419,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
                 writeln!(fmt.0)?;
             }
             for field_id in fields {
-                let Some(field) = docs.index.get(field_id) else {
+                let Some(field) = docs.index().get(&*field_id.0) else {
                     bail!("no union field found");
                 };
                 let Some(field_name) = &field.name else {
@@ -455,7 +455,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
                                 fields_stripped = true;
                                 continue;
                             };
-                            let Some(field) = docs.index.get(field_id) else {
+                            let Some(field) = docs.index().get(&*field_id.0) else {
                                 bail!("no struct field found");
                             };
                             let ItemEnum::StructField(field_ty) = &field.inner else {
@@ -482,7 +482,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
                         writeln!(fmt.0)?;
                     }
                     for field_id in fields {
-                        let Some(field) = docs.index.get(field_id) else {
+                        let Some(field) = docs.index().get(&*field_id.0) else {
                             bail!("no struct field found");
                         };
                         let Some(field_name) = &field.name else {
@@ -515,7 +515,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
             }
 
             for variant_id in variants {
-                let Some(variant) = docs.index.get(variant_id) else {
+                let Some(variant) = docs.index().get(&*variant_id.0) else {
                     bail!("no enum variant found");
                 };
                 let Some(variant_name) = &variant.name else {
@@ -537,7 +537,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
                                 fields_stripped = true;
                                 continue;
                             };
-                            let Some(field) = docs.index.get(field_id) else {
+                            let Some(field) = docs.index().get(&*field_id.0) else {
                                 bail!("no enum variant field found");
                             };
                             let ItemEnum::StructField(field_ty) = &field.inner else {
@@ -561,7 +561,7 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
                             writeln!(fmt.0)?;
                         }
                         for field_id in fields {
-                            let Some(field) = docs.index.get(field_id) else {
+                            let Some(field) = docs.index().get(&*field_id.0) else {
                                 bail!("no enum variant field found");
                             };
                             let Some(field_name) = &field.name else {

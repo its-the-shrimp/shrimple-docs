@@ -4,162 +4,138 @@ mod docs;
 mod item_visitor;
 
 use {
-    anyhow::{anyhow, bail, ensure, Context},
+    crate::{
+        docs::{Docs, SearchResult},
+        item_printer::print_item,
+        utils::{Exit, Result, StringView, BOLD, INVERT, NL, NOSTYLE, NULL_EVENT, OK},
+    },
+    anyhow::{bail, Context},
     crossterm::{
-        cursor::{MoveLeft, MoveToColumn, MoveToNextLine, MoveToPreviousLine, MoveToRow},
+        cursor::{
+            MoveLeft,
+            MoveToColumn,
+            MoveToNextLine,
+            MoveToPreviousLine,
+            MoveToRow,
+            RestorePosition,
+            SavePosition,
+        },
         event::{Event, KeyCode, KeyEvent, KeyModifiers},
         terminal::{
             disable_raw_mode,
             enable_raw_mode,
+            size,
             Clear,
             ClearType::FromCursorDown,
-            DisableLineWrap,
-            EnableLineWrap,
             ScrollUp,
         },
         ExecutableCommand,
         QueueableCommand,
     },
-    docs::{Docs, SearchResult},
-    rustdoc_types::Id,
-    std::{
-        io::{stdin, stdout, BufRead, BufReader, Write},
-        iter::once,
-        process::{Command, Stdio},
-        sync::Arc,
-    },
-    crate::{
-        item_printer::print_item,
-        utils::{
-            str_char_count,
-            EmptyError,
-            Exit,
-            StringView,
-            INVERT,
-            OK,
-            Result,
-            NL,
-            NULL_EVENT,
-            NOSTYLE,
-            BOLD,
-        },
-    },
+    std::{env::args_os, io::{stdin, stdout, Read, Write}, mem::take, panic},
 };
 
-/// if `None` is returned, the app is supposed to exit.
 fn next_key_event() -> Result<KeyEvent> {
     loop {
-        let Event::Key(event) = crossterm::event::read()? else {continue};
-        return match event.code {
-            KeyCode::Char('c') if event.modifiers == KeyModifiers::CONTROL => bail!(Exit),
-            _ => Ok(event),
-        }
+        let Event::Key(event) = crossterm::event::read()? else { continue };
+        break Ok(event)
     }
 }
 
-struct Ctx {
-    docs: Docs,
+struct Ctx<'docs> {
+    docs: &'docs Docs,
+    modes: Vec<Mode>,
     window_height: u16,
+    window_width: u16,
 }
 
-impl Ctx {
+impl<'docs> Ctx<'docs> {
     const DEFAULT_WINHEIGHT: u16 = 15;
 
-    async fn new(
-        r#in: &mut (impl BufRead + Send),
-        out: &mut (impl Write + Send),
-    ) -> Result<Self> {
-        let toolchains = Command::new("rustup")
-            .args(["toolchain", "list"])
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .output()?
-            .stdout;
-        let toolchains = String::from_utf8(toolchains).context("`rustup` gave non-UTF8 output")?;
-
-        let toolchain = if let Some(x) = toolchains.lines().rfind(|x| x.starts_with("nightly")) {
-            x.split_once(' ').map_or(x, |x| x.0)
-        } else {
-            writeln!(out, "It appears that you don't have a nightly Rust toolchain installed.")?;
-            writeln!(out, "A nightly toolchain is essential for this tool to function.")?;
-            writeln!(out, "Do you wish to install it?")?;
-            write  !(out, "Answer (y/n, anything else will abort the program): ")?;
-            out.flush()?;
-
-            let mut resp = [0u8; 2];
-            r#in.read_exact(&mut resp)?;
-            match &resp {
-                b"y\n" => {}
-                b"n\n" => bail!(Exit),
-                _ => bail!(EmptyError),
-            };
-
-            let status = Command::new("rustup")
-                .args(["toolchain", "install", "nightly", "--component", "rust-docs-json"])
-                .stderr(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .context("failed to launch `rustup toolchain install nightly`")?;
-            ensure!(status.success(), "`rustup` failed");
-
-            "nightly"
-        };
-
-        Ok(Self{
-            docs: Docs::new(&Arc::from(toolchain), r#in, out).await?,
+    fn new(docs: &'docs Docs) -> Result<Self> {
+        let mut res = Self {
+            docs,
             window_height: Self::DEFAULT_WINHEIGHT,
-        })
+            window_width: size()?.1,
+            modes: vec![],
+        };
+        res.modes.push(Mode::Search(SearchMode::new(String::new(), &res)));
+        Ok(res)
+    }
+
+    fn print_modes(&mut self, out: &mut impl Write) -> Result {
+        out.queue(MoveToRow(u16::MAX - 1))?
+            .queue(MoveToPreviousLine(self.window_height - 2))?
+            .queue(Clear(FromCursorDown))?;
+        write!(out, "{BOLD}Mode{NOSTYLE}: ")?;
+        for mode in self.modes.iter().rev() {
+            write!(out, "{} \u{2190} ", mode.name())?;
+        }
+        let mut mode = self.modes.last_mut().map(take).ok_or(Exit)?;
+        write!(out, "{NL}")?;
+        mode.init(self, out)?;
+        mode.process_key_event(&NULL_EVENT, self, out)?;
+        if let Some(mode_slot) = self.modes.last_mut() {
+            *mode_slot = mode;
+        }
+        OK
+    }
+
+    fn process_key_event(&mut self, event: &KeyEvent, out: &mut impl Write)
+        -> Result<Option<Mode>>
+    {
+        let mut mode = take(self.modes.last_mut().context("no mode while processing a key event")?);
+        let res = mode.process_key_event(event, self, out);
+        if let Some(mode_slot) = self.modes.last_mut() {
+            *mode_slot = mode;
+        }
+        res
     }
 }
 
-struct SearchMode<'ctx> {
+struct SearchMode {
     selected: Option<usize>,
     shift: usize,
     query: String,
-    results: Vec<SearchResult<'ctx>>,
+    results: Vec<SearchResult>,
 }
 
-impl<'ctx> SearchMode<'ctx> {
+impl SearchMode {
     const INPUT_PREFIX: &'static str = "search \u{2192} ";
-    const INPUT_PREFIX_LEN: usize = str_char_count(Self::INPUT_PREFIX);
 
-    fn new(query: String, ctx: &'ctx Ctx) -> Self {
+    const fn new(query: String, _: &Ctx) -> Self {
         Self {
             query,
             selected: None,
             shift: 0,
-            results: Vec::with_capacity(ctx.docs.index.len()),
+            results: vec![],
         }
     }
 
-    fn print_results(&self, ctx: &'ctx Ctx, out: &mut impl Write) -> Result {
-        let n = ctx.window_height - 4;
+    fn print_results(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
+        let n = ctx.window_height - 5;
+        out.queue(SavePosition)?;
 
-        for (i, result) in self.results.iter().enumerate().skip(self.shift).take(n as _) {
-            out.queue(MoveToColumn(0))?.queue(MoveToNextLine(1))?;
+        for (i, result) in self.results.iter().enumerate().skip(self.shift).take(n.into()) {
             let invert = if self.selected == Some(i) {INVERT} else {""};
-            write!(out, "{invert}{i}: {}{NOSTYLE}", result.id.0)?;
+            write!(out, "{NL}{invert}{i}: {}{NOSTYLE}", result.id)?;
         }
 
-        let n_advanced = self.results.len().try_into().unwrap_or(n).min(n);
-        if n_advanced > 0 {
-            out.queue(MoveToPreviousLine(n_advanced))?;
-        }
-        out.queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.query.len()).try_into()?))?;
+        out.queue(RestorePosition)?;
         OK
     }
 
-    fn init(&self, ctx: &'ctx Ctx, out: &mut impl Write) -> Result {
+    fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
         write!(out, "{BOLD}<Up/Down>{NOSTYLE} - go 1 line up/down in the results{NL}")?;
         write!(out, "{BOLD}<Ctrl-Up/Down>{NOSTYLE} - go to the top/bottom of the results{NL}")?;
         write!(out, "{}{}", Self::INPUT_PREFIX, self.query)?;
         self.print_results(ctx, out)
     }
 
-    fn process_key_event(&mut self, event: &KeyEvent, ctx: &'ctx Ctx, out: &mut impl Write)
-        -> Result<Option<Mode<'ctx>>>
+    fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
+        -> Result<Option<Mode>>
     {
-        let n_results = ctx.window_height as usize - 4;
+        let n_results = ctx.window_height as usize - 5;
 
         let changed = match event.code {
             KeyCode::Up => {
@@ -192,24 +168,22 @@ impl<'ctx> SearchMode<'ctx> {
             }
 
             KeyCode::Enter => if let Some(selected) = self.selected {
-                out.queue(MoveToPreviousLine(3))?.queue(Clear(FromCursorDown))?;
-                let docview = DocViewMode::new(self.results[selected].id, ctx)?;
+                let docview = DocViewMode::new(&self.results[selected].id, ctx)?;
                 return Ok(Some(Mode::DocView(docview)))
             } else {
-                false
+                true
             }
 
             KeyCode::Char(ch) if ch != '\n' => {
                 self.query.push(ch);
                 write!(out, "{ch}")?;
-                true
+                false
             }
 
-            KeyCode::Backspace => if self.query.pop().is_some() {
-                out.queue(MoveLeft(1))?;
-                write!(out, " ")?;
-                true
-            } else {
+            KeyCode::Backspace => {
+                if self.query.pop().is_some() {
+                    write!(out, "\x1b[1D \x1b[1D")?;
+                }
                 false
             }
 
@@ -218,7 +192,7 @@ impl<'ctx> SearchMode<'ctx> {
         out.queue(Clear(FromCursorDown))?;
 
         if changed {
-            ctx.docs.search(&self.query, &mut self.results);
+            ctx.docs.search(&mut self.query, &mut self.results)?;
         }
         self.print_results(ctx, out)?;
         Ok(None)
@@ -226,55 +200,47 @@ impl<'ctx> SearchMode<'ctx> {
 }
 
 struct DocViewMode {
-    id: Id,
+    id: String,
     view: Option<StringView>,
 }
 
 impl DocViewMode {
     const INPUT_PREFIX: &'static str = "view \u{2192} ";
-    const INPUT_PREFIX_LEN: usize = str_char_count(Self::INPUT_PREFIX);
 
-    fn get_view(id: &Id, ctx: &Ctx) -> Result<Option<StringView>> {
-        let Some(item) = ctx.docs.index.get(id) else {
+    fn get_view(id: &str, ctx: &Ctx) -> Result<Option<StringView>> {
+        let Some(item) = ctx.docs.index().get(id) else {
             return Ok(None);
         };
         let mut content = StringView::new(String::new(), -1, -1);
-        print_item(item, &ctx.docs, &mut content)?;
+        print_item(item, ctx.docs, &mut content)?;
         Ok(Some(content))
     }
 
-    fn new(id: &Id, ctx: &Ctx) -> Result<Self> {
+    fn new(id: &str, ctx: &Ctx) -> Result<Self> {
         Ok(Self { view: Self::get_view(id, ctx)?, id: id.to_owned() })
     }
 
     fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        write!(out, "{}{}{NL}", Self::INPUT_PREFIX, self.id.0)?;
-        if let Some(view) = &self.view {
-            view.print(out)?;
-        } else {
-           write!(out, "Not Found")?;
-        }
-        out.queue(MoveToRow(u16::MAX - 1))?
-            .queue(MoveToPreviousLine(ctx.window_height - 2))?
-            .queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.id.0.len()).try_into()?))?;
-        OK
+        write!(out, "{}{}", Self::INPUT_PREFIX, self.id)?;
+        self.print_docs(ctx, out)
     }
 
     fn print_docs(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        out.queue(MoveToNextLine(1))?.queue(MoveToColumn(0))?.queue(Clear(FromCursorDown))?;
+        out.queue(SavePosition)?
+            .queue(MoveToNextLine(1))?
+            .queue(MoveToColumn(0))?
+            .queue(Clear(FromCursorDown))?;
         if let Some(view) = &self.view {
-            view.print(out)?;
+            view.print(out, ctx.window_height - 4, ctx.window_width)?;
         } else {
            write!(out, "Not Found")?;
         }
-        out.queue(MoveToRow(u16::MAX - 1))?
-            .queue(MoveToPreviousLine(ctx.window_height - 2))?
-            .queue(MoveToColumn((Self::INPUT_PREFIX_LEN + self.id.0.len()).try_into()?))?;
+        out.queue(RestorePosition)?;
         OK
     }
 
-    fn process_key_event<'ctx>(&mut self, event: &KeyEvent, ctx: &'ctx Ctx, out: &mut impl Write)
-        -> Result<Option<Mode<'ctx>>>
+    fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
+        -> Result<Option<Mode>>
     {
         let mut changed = self.view.as_mut().is_some_and(|x| x.process_key_event(event));
         changed |= match event.code {
@@ -289,12 +255,12 @@ impl DocViewMode {
             }
 
             KeyCode::Char(ch) if ch != '\n' => {
-                self.id.0.push(ch);
+                self.id.push(ch);
                 write!(out, "{ch}")?;
                 true
             }
 
-            KeyCode::Backspace => if self.id.0.pop().is_some() {
+            KeyCode::Backspace => if self.id.pop().is_some() {
                 out.queue(MoveLeft(1))?;
                 write!(out, " ")?;
                 true
@@ -312,14 +278,18 @@ impl DocViewMode {
     }
 }
 
-enum Mode<'ctx> {
-    Search(SearchMode<'ctx>),
+#[derive(Default)]
+enum Mode {
+    #[default]
+    None,
+    Search(SearchMode),
     DocView(DocViewMode),
 }
 
-impl<'ctx> Mode<'ctx> {
-    fn init(&self, ctx: &'ctx Ctx, out: &mut impl Write) -> Result {
+impl Mode {
+    fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
         match self {
+            Self::None => OK,
             Self::Search(m) => m.init(ctx, out),
             Self::DocView(m) => m.init(ctx, out),
         }
@@ -327,81 +297,86 @@ impl<'ctx> Mode<'ctx> {
 
     const fn name(&self) -> &'static str {
         match self {
+            Self::None => "",
             Self::Search(_) => "SEARCH",
             Self::DocView(_) => "DOCUMENTATION VIEW",
         }
     }
 
-    fn process_key_event(&mut self, event: &KeyEvent, ctx: &'ctx Ctx, out: &mut impl Write)
+    fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
         -> Result<Option<Self>>
     {
         match self {
+            Self::None => Ok(None),
             Self::Search(m) => m.process_key_event(event, ctx, out),
             Self::DocView(m) => m.process_key_event(event, ctx, out),
         }
     }
 }
 
-fn print_modes<'ctx>(
-    modes: impl IntoIterator<IntoIter = impl DoubleEndedIterator<Item = &'ctx Mode<'ctx>>>,
-    out: &mut impl Write,
-) -> Result {
-    write!(out, "{BOLD}Mode{NOSTYLE}: ")?;
-    for mode in modes.into_iter().rev() {
-        write!(out, "{} \u{2190} ", mode.name())?;
-    }
-    write!(out, "{NL}")?;
-    OK
-}
-
 async fn main_inner(
-    r#in: &mut (impl BufRead + Send),
-    mut out: &mut (impl Write + Send),
+    args: Args,
+    r#in: &mut (impl Read + Send),
+    out: &mut (impl Write + Send),
 ) -> Result {
-    let ctx = Ctx::new(r#in, out).await?;
+    let docs = Docs::new(r#in, out, args.offline).await?;
+    let mut ctx = Ctx::new(&docs)?;
     enable_raw_mode()?;
     out.queue(ScrollUp(ctx.window_height))?
         .queue(MoveToPreviousLine(ctx.window_height))?;
     write!(out, "{BOLD}Shrimple{NOSTYLE} documentation v{}{NL}", env!("CARGO_PKG_VERSION"))?;
-    let mut modes = vec![Mode::Search(SearchMode::new(String::new(), &ctx))];
-    print_modes(&modes, &mut out)?;
-    modes[0].init(&ctx, &mut out)?;
+    ctx.print_modes(out)?;
     out.flush()?;
 
     loop {
-        let event = next_key_event()?;
-        if event.code == KeyCode::Esc && event.modifiers == KeyModifiers::NONE {
-            modes.pop();
-            out.queue(MoveToRow(u16::MAX - 1))?
-                .queue(MoveToPreviousLine(ctx.window_height - 1))?
-                .queue(Clear(FromCursorDown))?;
-            print_modes(&modes, &mut out)?;
-            let mode = modes.last_mut().ok_or_else(|| anyhow!(Exit))?;
-            mode.init(&ctx, &mut out)?;
-            mode.process_key_event(&NULL_EVENT, &ctx, &mut out)?;
-        } else if let Some(mut new_mode) = modes.last_mut().context("bug: no mode")?
-            .process_key_event(&event, &ctx, &mut out)?
-        {
-            out.queue(MoveToRow(u16::MAX - 1))?
-                .queue(MoveToPreviousLine(ctx.window_height - 1))?
-                .queue(Clear(FromCursorDown))?;
-            print_modes(modes.iter().chain(once(&new_mode)), &mut out)?;
-            new_mode.init(&ctx, &mut out)?;
-            new_mode.process_key_event(&NULL_EVENT, &ctx, &mut out)?;
-            modes.push(new_mode);
+        let key_event = next_key_event()?;
+        if key_event.code == KeyCode::Char('c') && key_event.modifiers == KeyModifiers::CONTROL {
+            bail!(Exit)
+        } else if key_event.code == KeyCode::Esc && key_event.modifiers == KeyModifiers::NONE {
+            ctx.modes.pop();
+            ctx.print_modes(out)?;
+        } else if let Some(new_mode) = ctx.process_key_event(&key_event, out)? {
+            ctx.modes.push(new_mode);
+            ctx.print_modes(out)?;
         }
         out.flush()?;
-        
+    }
+}
+
+struct Args {
+    offline: bool,
+}
+
+impl Args {
+    fn parse() -> Result<Self> {
+        let mut args = args_os();
+        let _program_name = args.next().context("no program name provided to `shrimple-docs`")?;
+        let offline = args.next().is_some_and(|x| x == "--offline");
+        if let Some(extra) = args.next() {
+            bail!("extra arguments starting from {extra:?}");
+        }
+        Ok(Self { offline })
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result {
+    let builtin_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        _ = stdout().execute(RestorePosition);
+        _ = disable_raw_mode();
+        builtin_hook(info);
+    }));
     let mut stdout = stdout();
-    let mut stdin = BufReader::new(stdin());
-    stdout.execute(DisableLineWrap).inspect_err(|_| _ = disable_raw_mode())?;
-    let res = main_inner(&mut stdin, &mut stdout).await;
-    stdout.execute(EnableLineWrap)?;
+    let mut stdin = stdin();
+    let args = Args::parse()?;
+    stdout.execute(SavePosition)?;
+    let res = main_inner(args, &mut stdin, &mut stdout).await;
     disable_raw_mode()?;
-    res
+    _ = stdout.execute(RestorePosition)?;
+    writeln!(stdout)?;
+    Ok(match res {
+        Err(e) if e.is::<Exit>() => writeln!(stdout, "{Exit}")?,
+        x => x?,
+    })
 }

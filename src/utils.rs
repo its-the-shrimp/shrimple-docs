@@ -1,17 +1,14 @@
 use {
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     std::{
         cmp::Ordering,
+        error::Error,
         fmt::{Debug, Display, Formatter, Write},
         ops::Deref,
         ptr::copy_nonoverlapping,
         slice,
         str::from_utf8_unchecked,
-    },
-    crossterm::{
-        QueueableCommand,
-        cursor::MoveToPreviousLine,
-        event::{KeyCode, KeyEvent, KeyModifiers},
-    },
+    }
 };
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
@@ -21,9 +18,18 @@ pub const INVERT: &str = "\x1b[7m";
 pub const BOLD: &str = "\x1b[1m";
 pub const GREEN: &str = "\x1b[32m";
 pub const NOSTYLE: &str = "\x1b[0m";
+pub const PREVLINE: &str = "\x1b[1F";
 pub const NL: &str = "\x1b[1E\x1b[0G";
 pub const CLEARLINE: &str = "\x1b[2K\r";
 pub const NULL_EVENT: KeyEvent = KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
+
+pub trait IteratorExt<T, E>: Sized + Iterator<Item = Result<T, E>> {
+    fn try_collect<U: FromIterator<T>>(self) -> Result<U, E> {
+        self.collect()
+    }
+}
+
+impl<T, E, I: Iterator<Item = Result<T, E>>> IteratorExt<T, E> for I {}
 
 pub trait BoolExt {
     fn pick<T>(self, on_true: T, on_false: T) -> T;
@@ -33,74 +39,6 @@ impl BoolExt for bool {
     fn pick<T>(self, on_true: T, on_false: T) -> T {
         if self {on_true} else {on_false}
     }
-}
-
-/**
- * `levenshtein-rs` - levenshtein
- *
- * MIT licensed.
- *
- * Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
- */
-#[must_use]
-pub fn levenshtein(a: &str, b: &str) -> usize {
-    let mut result = 0;
-
-    /* Shortcut optimizations / degenerate cases. */
-    if a == b {
-        return result;
-    }
-
-    let length_a = a.chars().count();
-    let length_b = b.chars().count();
-
-    if length_a == 0 {
-        return length_b;
-    }
-
-    if length_b == 0 {
-        return length_a;
-    }
-
-    /* Initialize the vector.
-     *
-     * This is why it’s fast, normally a matrix is used,
-     * here we use a single vector. */
-    let mut cache: Vec<usize> = (1..).take(length_a).collect();
-    let mut distance_a;
-    let mut distance_b;
-
-    /* Loop. */
-    for (index_b, code_b) in b.chars().enumerate() {
-        result = index_b;
-        distance_a = index_b;
-
-        for (index_a, code_a) in a.chars().enumerate() {
-            distance_b = if code_a == code_b {
-                distance_a
-            } else {
-                distance_a + 1
-            };
-
-            distance_a = cache[index_a];
-
-            result = if distance_a > result {
-                if distance_b > result {
-                    result + 1
-                } else {
-                    distance_b
-                }
-            } else if distance_b > distance_a {
-                distance_a + 1
-            } else {
-                distance_b
-            };
-
-            cache[index_a] = result;
-        }
-    }
-
-    result
 }
 
 #[derive(Debug)]
@@ -177,7 +115,7 @@ impl StringView {
 
             KeyCode::Up => self.scroll = match event.modifiers {
                 KeyModifiers::NONE => self.scroll.saturating_sub(1).max(self.min_scroll),
-                KeyModifiers::SHIFT => self.max_scroll,
+                KeyModifiers::SHIFT => self.min_scroll,
                 _ => return false,
             },
 
@@ -198,18 +136,25 @@ impl StringView {
         true
     }
 
-    pub fn print(&self, out: &mut impl std::io::Write) -> Result {
+    pub fn print(
+        &self,
+        out: &mut impl std::io::Write,
+        width: u16,
+        height: u16,
+    ) -> Result {
         for _ in self.scroll .. 0 {
             write!(out, "{NL}")?;
         }
-        let shift = self.shift.try_into().unwrap_or(0usize);
-        for line in self.content.lines().skip(self.scroll.try_into().unwrap_or(0)) {
+        let shift = self.shift.try_into().unwrap_or(0usize).min(width.into());
+        for line in self.content.lines()
+            .skip(self.scroll.try_into().unwrap_or(0))
+            .take(height.into())
+        {
             for _ in self.shift .. 0 {
                 out.write_all(b" ")?;
             }
             write!(out, "{}{NL}", line.get(shift..).unwrap_or(""))?;
         }
-        out.queue(MoveToPreviousLine(u16::try_from(self.max_scroll - self.scroll)?))?;
         Ok(())
     }
 }
@@ -219,18 +164,22 @@ pub struct EmptyError;
 
 impl Display for EmptyError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.write_str(CLEARLINE)
+        write!(f, "{CLEARLINE}{PREVLINE}")
     }
 }
+
+impl Error for EmptyError {}
 
 #[derive(Debug)]
 pub struct Exit;
 
 impl Display for Exit {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.write_str(CLEARLINE)
+        write!(f, "{CLEARLINE}{PREVLINE}")
     }
 }
+
+impl Error for Exit {}
 
 #[derive(Clone, Copy)]
 pub struct ShortStr<const CAP: usize = 15> {
@@ -325,15 +274,4 @@ impl<const CAP: usize> ShortStr<CAP> {
         // write `&str`s to it.
         unsafe { from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize)) }
     }
-}
-
-pub const fn str_char_count(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let [mut res, mut i] = [0, 0];
-    while i < len {
-        res += (bytes[i].leading_ones() != 1) as usize;
-        i += 1;
-    }
-    res
 }
