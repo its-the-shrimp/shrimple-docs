@@ -27,6 +27,8 @@ use {
             size,
             Clear,
             ClearType::FromCursorDown,
+            DisableLineWrap,
+            EnableLineWrap,
             ScrollUp,
         },
         ExecutableCommand,
@@ -63,7 +65,7 @@ impl<'docs> Ctx<'docs> {
         Ok(res)
     }
 
-    fn print_modes(&mut self, out: &mut impl Write) -> Result {
+    async fn print_modes(&mut self, out: &mut (impl Write + Send)) -> Result {
         out.queue(MoveToRow(u16::MAX - 1))?
             .queue(MoveToPreviousLine(self.window_height - 2))?
             .queue(Clear(FromCursorDown))?;
@@ -74,18 +76,18 @@ impl<'docs> Ctx<'docs> {
         let mut mode = self.modes.last_mut().map(take).ok_or(Exit)?;
         write!(out, "{NL}")?;
         mode.init(self, out)?;
-        mode.process_key_event(&NULL_EVENT, self, out)?;
+        mode.process_key_event(&NULL_EVENT, self, out).await?;
         if let Some(mode_slot) = self.modes.last_mut() {
             *mode_slot = mode;
         }
         OK
     }
 
-    fn process_key_event(&mut self, event: &KeyEvent, out: &mut impl Write)
+    async fn process_key_event(&mut self, event: &KeyEvent, out: &mut (impl Write + Send))
         -> Result<Option<Mode>>
     {
         let mut mode = take(self.modes.last_mut().context("no mode while processing a key event")?);
-        let res = mode.process_key_event(event, self, out);
+        let res = mode.process_key_event(event, self, out).await;
         if let Some(mode_slot) = self.modes.last_mut() {
             *mode_slot = mode;
         }
@@ -116,6 +118,10 @@ impl SearchMode {
         let n = ctx.window_height - 5;
         out.queue(SavePosition)?;
 
+        if self.results.is_empty() {
+            write!(out, "{NL}<no results>")?;
+        }
+
         for (i, result) in self.results.iter().enumerate().skip(self.shift).take(n.into()) {
             let invert = if self.selected == Some(i) {INVERT} else {""};
             write!(out, "{NL}{invert}{i}: {}{NOSTYLE}", result.id)?;
@@ -132,7 +138,12 @@ impl SearchMode {
         self.print_results(ctx, out)
     }
 
-    fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
+    async fn process_key_event(
+        &mut self,
+        event: &KeyEvent,
+        ctx: &Ctx<'_>,
+        out: &mut (impl Write + Send),
+    )
         -> Result<Option<Mode>>
     {
         let n_results = ctx.window_height as usize - 5;
@@ -192,7 +203,7 @@ impl SearchMode {
         out.queue(Clear(FromCursorDown))?;
 
         if changed {
-            ctx.docs.search(&mut self.query, &mut self.results)?;
+            ctx.docs.search(&mut self.query, &mut self.results).await?;
         }
         self.print_results(ctx, out)?;
         Ok(None)
@@ -303,12 +314,17 @@ impl Mode {
         }
     }
 
-    fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
+    async fn process_key_event(
+        &mut self,
+        event: &KeyEvent,
+        ctx: &Ctx<'_>,
+        out: &mut (impl Write + Send),
+    )
         -> Result<Option<Self>>
     {
         match self {
             Self::None => Ok(None),
-            Self::Search(m) => m.process_key_event(event, ctx, out),
+            Self::Search(m) => m.process_key_event(event, ctx, out).await,
             Self::DocView(m) => m.process_key_event(event, ctx, out),
         }
     }
@@ -325,7 +341,7 @@ async fn main_inner(
     out.queue(ScrollUp(ctx.window_height))?
         .queue(MoveToPreviousLine(ctx.window_height))?;
     write!(out, "{BOLD}Shrimple{NOSTYLE} documentation v{}{NL}", env!("CARGO_PKG_VERSION"))?;
-    ctx.print_modes(out)?;
+    ctx.print_modes(out).await?;
     out.flush()?;
 
     loop {
@@ -334,10 +350,10 @@ async fn main_inner(
             bail!(Exit)
         } else if key_event.code == KeyCode::Esc && key_event.modifiers == KeyModifiers::NONE {
             ctx.modes.pop();
-            ctx.print_modes(out)?;
-        } else if let Some(new_mode) = ctx.process_key_event(&key_event, out)? {
+            ctx.print_modes(out).await?;
+        } else if let Some(new_mode) = ctx.process_key_event(&key_event, out).await? {
             ctx.modes.push(new_mode);
-            ctx.print_modes(out)?;
+            ctx.print_modes(out).await?;
         }
         out.flush()?;
     }
@@ -363,17 +379,19 @@ impl Args {
 async fn main() -> Result {
     let builtin_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        _ = stdout().execute(RestorePosition);
+        let mut stdout = stdout();
+        _ = stdout.execute(RestorePosition);
+        _ = stdout.execute(EnableLineWrap);
         _ = disable_raw_mode();
         builtin_hook(info);
     }));
     let mut stdout = stdout();
     let mut stdin = stdin();
     let args = Args::parse()?;
-    stdout.execute(SavePosition)?;
+    stdout.execute(SavePosition)?.execute(DisableLineWrap)?;
     let res = main_inner(args, &mut stdin, &mut stdout).await;
     disable_raw_mode()?;
-    _ = stdout.execute(RestorePosition)?;
+    _ = stdout.execute(RestorePosition)?.execute(EnableLineWrap)?;
     writeln!(stdout)?;
     Ok(match res {
         Err(e) if e.is::<Exit>() => writeln!(stdout, "{Exit}")?,

@@ -18,10 +18,11 @@ use {
     serde::Deserialize,
     serde_json::Value,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
+        env::temp_dir,
         ffi::OsStr,
         fs::File,
-        io::{BufRead, BufReader, Read, Write},
+        io::{BufReader as SyncBufReader, Read, Write},
         mem::take,
         path::{Path, PathBuf},
         process::{Output, Stdio},
@@ -29,7 +30,7 @@ use {
         sync::Arc,
         vec,
     },
-    tokio::{process::Command, try_join},
+    tokio::{io::{BufReader, AsyncBufReadExt, AsyncReadExt}, process::Command, try_join},
 };
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
@@ -172,7 +173,7 @@ impl VisitorMut for IdNormaliser<'_> {
 
 fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Arc<str>, Item)>> {
     let path = path.as_ref();
-    let docs: Crate = match serde_json::from_reader(BufReader::new(File::open(path)?)) {
+    let docs: Crate = match serde_json::from_reader(SyncBufReader::new(File::open(path)?)) {
         Ok(x) => x,
         Err(e) => {
             #[derive(Deserialize)]
@@ -288,6 +289,31 @@ impl Documentable {
     }
 }
 
+async fn get_packages_in_tree(toolchain: &str) -> Result<HashSet<Box<str>>> {
+    let mut cargo_tree = Command::new("rustup")
+        .args(["run", toolchain, "cargo", "tree", "--prefix", "none"])
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    if !cargo_tree.wait().await?.success() {
+        bail!("`cargo tree --prefix none` failed");
+    }
+
+    let mut res = HashSet::new();
+    let mut stdout = cargo_tree.stdout
+        .map(BufReader::new)
+        .context("failed to get the stdout of `cargo tree`")?;
+    let mut line = String::new();
+
+    while stdout.read_line(&mut line).await? > 0 {
+        let (name, _) = line.split_once(' ').context("invalid output from `cargo tree`")?;
+        res.insert(Box::from(name));
+        line.clear();
+    }
+
+    Ok(res)
+}
+
 async fn get_gen_ctx(toolchain: Arc<str>) -> Result<DocsGen> {
     let Output { status, stdout, .. } = Command::new("rustup")
         .args(["run", &toolchain, "cargo", "metadata", "--format-version=1"])
@@ -296,6 +322,9 @@ async fn get_gen_ctx(toolchain: Arc<str>) -> Result<DocsGen> {
     ensure!(status.success(), "`cargo metadata` failed");
 
     let mut metadata: CargoMetadata = serde_json::from_slice(&stdout)?;
+    let packages_in_tree = get_packages_in_tree(&toolchain).await?;
+    metadata.packages.retain(|package| packages_in_tree.contains(&*package.name));
+
     let deps = metadata.packages.iter_mut()
         .find(|x| x.id == metadata.resolve.root)
         .map(|x| take(&mut x.dependencies))
@@ -427,7 +456,9 @@ impl Docs {
             true
         };
 
-        let fzf_input_path = ctx.target_directory.join(".fzfinput").into_boxed_path();
+        let mut fzf_input_path = temp_dir();
+        fzf_input_path.push(".shrimple_fzfinput");
+        let fzf_input_path = fzf_input_path.into_boxed_path();
         let mut fzf_input = File::create(&fzf_input_path)?;
 
         if include_std_docs {
@@ -467,7 +498,7 @@ impl Docs {
     }
 
     /// `term` is guaranteed to be unchanged, this is just an optimisation
-    pub fn search(&self, term: &mut String, dst: &mut Vec<SearchResult>) -> Result {
+    pub async fn search(&self, term: &mut String, dst: &mut Vec<SearchResult>) -> Result {
         dst.clear();
 
         let item_kind_constrained = if term.is_empty() {
@@ -483,7 +514,7 @@ impl Docs {
             false
         };
 
-        let fzf = std::process::Command::new("fzf")
+        let fzf = Command::new("fzf")
             .args(["-f", term])
             .stdin(File::open(&self.fzf_input_path)?)
             .stdout(Stdio::piped())
@@ -495,23 +526,23 @@ impl Docs {
         }
 
         let mut fzf = fzf?;
-        let mut stdout = fzf.stdout.take()
-            .map(BufReader::new)
-            .context("failed to get the stdout of `fzf`")?;
-        let mut line = String::new();
 
-        if !fzf.wait()?.success() {
-            let mut err_msg = "`fzf` failed\nstderr:".to_owned();
+        if !fzf.wait().await?.success() {
             if let Some(stderr) = &mut fzf.stderr {
-                err_msg.push('\n');
-                stderr.read_to_string(&mut err_msg)?;
+                let mut err_msg = String::new();
+                stderr.read_to_string(&mut err_msg).await?;
+                if !err_msg.is_empty() {
+                    err_msg.insert_str(0, "`fzf` failed\nstderr:");
+                    bail!(err_msg);
+                }
             } else {
-                err_msg.push_str(" <failed to get stderr>");
+                bail!("`fzf` failed\nstderr: <failed to get stderr>");
             }
-            bail!(err_msg)
         }
 
-        while stdout.read_line(&mut line)? > 0 {
+        let mut stdout = BufReader::new(fzf.stdout.context("failed to get the stdout of `fzf`")?);
+        let mut line = String::new();
+        while stdout.read_line(&mut line).await? > 0 {
             let (id, _) = self.index
                 .get_key_value(line.trim_end_matches('\n'))
                 .with_context(|| format!("invalid otuput from `fzf`: item {line:?} not found"))?;
