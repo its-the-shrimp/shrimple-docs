@@ -7,13 +7,15 @@ edition = "2021"
 anyhow = "1"
 crossterm = "0.27.0"
 rustdoc-types = "0.26"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 paste = "1"
 tokio = { version = "1", features = ["macros", "rt", "process", "io-util"] }
+dirs = "5"
 
 [lints.clippy]
 # complexity = { level = "warn", priority = -1 }
+type_complexity = "allow"
 unit_arg = "allow"
 
 # restriction = { level = "allow", priority = -1 }

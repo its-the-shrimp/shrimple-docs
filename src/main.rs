@@ -2,6 +2,7 @@ mod utils;
 mod item_printer;
 mod docs;
 mod item_visitor;
+mod cache;
 
 use {
     crate::{

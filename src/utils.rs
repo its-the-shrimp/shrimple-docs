@@ -23,6 +23,19 @@ pub const NL: &str = "\x1b[1E\x1b[0G";
 pub const CLEARLINE: &str = "\x1b[2K\r";
 pub const NULL_EVENT: KeyEvent = KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
 
+pub trait OptionExt<T> {
+    fn inspect_mut(self, f: impl FnOnce(&mut T)) -> Self;
+}
+
+impl<T> OptionExt<T> for Option<T> {
+    fn inspect_mut(mut self, f: impl FnOnce(&mut T)) -> Self {
+        if let Some(x) = &mut self {
+            f(x);
+        }
+        self
+    }
+}
+
 pub trait IteratorExt<T, E>: Sized + Iterator<Item = Result<T, E>> {
     fn try_collect<U: FromIterator<T>>(self) -> Result<U, E> {
         self.collect()

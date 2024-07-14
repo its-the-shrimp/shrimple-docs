@@ -1,17 +1,8 @@
 use {
     crate::{
+        cache,
         item_visitor::VisitorMut,
-        utils::{
-            BoolExt,
-            EmptyError,
-            Exit,
-            IteratorExt,
-            Result,
-            BOLD,
-            GREEN,
-            NOSTYLE,
-            OK,
-        }
+        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, NOSTYLE, OK},
     },
     anyhow::{bail, ensure, Context},
     rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
@@ -30,7 +21,7 @@ use {
         sync::Arc,
         vec,
     },
-    tokio::{io::{BufReader, AsyncBufReadExt, AsyncReadExt}, process::Command, try_join},
+    tokio::{io::{AsyncBufReadExt, AsyncReadExt, BufReader}, process::Command, try_join},
 };
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
@@ -71,6 +62,8 @@ struct Target<'src> {
 struct Package<'src> {
     id: &'src str,
     name: String,
+    version: String,
+    source: Option<String>,
     #[serde(default)]
     metadata: Value,
     #[serde(borrow)]
@@ -101,12 +94,15 @@ pub struct DocsGen {
 }
 
 impl DocsGen {
-    pub async fn document_next(&mut self, offline: bool)
-        -> Option<Result<(Vec<(Arc<str>, Item)>, Arc<str>)>>
+    pub async fn document_next(&mut self, out: &mut (impl Write + Send), offline: bool)
+        -> Result<Option<Vec<(Arc<str>, Item)>>>
     {
-        let next = self.packages.next()?;
+        let Some(next) = self.packages.next() else {
+            return Ok(None);
+        };
         let name = next.name.clone();
-        Some(next.document(offline, &self.toolchain, &self.target_directory).await.map(|x| (x, name)))
+        writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
+        next.document(offline, &self.toolchain, &self.target_directory).await.map(Some)
     }
 }
 
@@ -228,6 +224,8 @@ struct Documentable {
     // TODO: allow for documenting multiple crates defined by 1 package
     name: Arc<str>,
     manifest_path: String,
+    registry: Option<String>,
+    version: String,
     config: DocConfig,
 }
 
@@ -245,6 +243,8 @@ impl TryFrom<Package<'_>> for Documentable {
                 .find(|t| t.kind.contains(&"lib"))
                 .map_or_else(|| p.name.replace('-', "_").into(), |t| t.name.into()),
             manifest_path: p.manifest_path,
+            registry: p.source,
+            version: p.version,
             config,
         })
     }
@@ -257,6 +257,13 @@ impl Documentable {
         toolchain: impl AsRef<str> + Send,
         target_directory: impl AsRef<Path> + Send,
     ) -> Result<Vec<(Arc<str>, Item)>> {
+        if let Some(Some(cached)) = self.registry.as_ref()
+            .map(|r| cache::load(r, &self.name, &self.version))
+            .transpose()?
+        {
+            return Ok(cached);
+        }
+
         let target_directory = target_directory.as_ref();
         let mut cmd = Command::new("rustup");
         cmd
@@ -275,7 +282,7 @@ impl Documentable {
             .stdout(Stdio::null());
         let Output { status, stderr, .. } = cmd
             .output().await
-            .context("failed to launch `rustup run cargo rustdoc`")?;
+            .context("failed to launch `cargo rustdoc`")?;
         if !status.success() {
             bail!("`cargo rustdoc` failed;\ncommand: {cmd:#?}\noutput:\n{}",
                 String::from_utf8_lossy(&stderr));
@@ -285,7 +292,11 @@ impl Documentable {
         docs_path.push(&*self.name);
         docs_path.set_extension("json");
 
-        parse_json_docs(docs_path)
+        let res = parse_json_docs(docs_path)?;
+        if let Some(registry) = &self.registry {
+            cache::store(&res, registry, &self.name, &self.version)?;
+        }
+        Ok(res)
     }
 }
 
@@ -429,7 +440,7 @@ impl Docs {
         let mut index = HashMap::new();
         let toolchain = get_nightly_toolchain(r#in, out).await?;
 
-        writeln!(out, "{GREEN}{BOLD}Extracting{NOSTYLE} crate and system metadata")?;
+        writeln!(out, "{GREEN}{BOLD}    Extracting{NOSTYLE} crate and system metadata")?;
         let (mut ctx, std_docs_dir) = try_join! {
             get_gen_ctx(toolchain.clone()),
             get_std_docs_dir(&toolchain),
@@ -466,7 +477,7 @@ impl Docs {
                 let file = entry?.path();
                 let name = Path::new(file.file_stem().context("no standard library name")?)
                     .display();
-                writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} {name}")?;
+                writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
                 let docs = parse_json_docs(file)?;
                 index.reserve(docs.len());
                 for (id, item) in docs {
@@ -478,9 +489,7 @@ impl Docs {
             }
         }
 
-        while let Some(docs) = ctx.document_next(offline).await {
-            let (docs, name) = docs?;
-            writeln!(out, "{GREEN}{BOLD}Documenting{NOSTYLE} {name}")?;
+        while let Some(docs) = ctx.document_next(out, offline).await? {
             index.reserve(docs.len());
             for (id, item) in docs {
                 if id.bytes().nth(1) != Some(b':') {
