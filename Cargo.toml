@@ -35,5 +35,5 @@ ignored_unit_patterns = "allow"
 unsafe_derive_deserialize = "allow"
 
 nursery = { level = "warn", priority = -1 }
-option_map_or_else = "allow"
+option_if_let_else = "allow"
 or_fun_call = "allow"

@@ -2,24 +2,14 @@ use {
     crate::{
         cache,
         item_visitor::VisitorMut,
-        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, NOSTYLE, OK},
+        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, NOSTYLE, OK, YELLOW},
     },
     anyhow::{bail, ensure, Context},
     rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
     serde::Deserialize,
     serde_json::Value,
     std::{
-        collections::{HashMap, HashSet},
-        env::temp_dir,
-        ffi::OsStr,
-        fs::File,
-        io::{BufReader as SyncBufReader, Read, Write},
-        mem::take,
-        path::{Path, PathBuf},
-        process::{Output, Stdio},
-        ptr::{addr_of, addr_of_mut},
-        sync::Arc,
-        vec,
+        collections::{HashMap, HashSet}, env::temp_dir, ffi::OsStr, fmt::{Display, Formatter}, fs::File, io::{BufReader as SyncBufReader, Read, Write}, mem::take, path::{Path, PathBuf}, process::{Output, Stdio}, ptr::{addr_of, addr_of_mut}, sync::Arc, vec
     },
     tokio::{io::{AsyncBufReadExt, AsyncReadExt, BufReader}, process::Command, try_join},
 };
@@ -102,7 +92,14 @@ impl DocsGen {
         };
         let name = next.name.clone();
         writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
-        next.document(offline, &self.toolchain, &self.target_directory).await.map(Some)
+        match next.document(offline, &self.toolchain, &self.target_directory).await {
+            Ok(x) => Ok(Some(x)),
+            Err(e) if e.is::<CompilationFailed>() => {
+                writeln!(out, "{YELLOW}{BOLD}        Failed{NOSTYLE} to document `{name}`")?;
+                Ok(Some(vec![]))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -250,6 +247,18 @@ impl TryFrom<Package<'_>> for Documentable {
     }
 }
 
+/// Returned from [`Documentable::document`] to mark that a crate failed to compile
+#[derive(Debug, Clone, Copy)]
+struct CompilationFailed;
+
+impl Display for CompilationFailed {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compilation failed")
+    }
+}
+
+impl std::error::Error for CompilationFailed {}
+
 impl Documentable {
     async fn document(
         self,
@@ -269,24 +278,27 @@ impl Documentable {
         cmd
             .args(["run", toolchain.as_ref(), "cargo"])
             .args(self.config.cargo_args)
-            .args(["rustdoc", "--verbose", "--manifest-path", &self.manifest_path, "--target-dir"])
+            .args(["rustdoc", "--manifest-path", &self.manifest_path, "--target-dir"])
             .arg(target_directory)
             .args(offline.then_some("--offline"))
             .args(self.config.all_features.then_some("--all-features"))
             .args(self.config.no_default_features.then_some("--no-default-features"))
             .args(self.config.features.iter().flat_map(|f| ["-F", f]))
-            .args(["-Zunstable-options", "--output-format=json", "--", "--cfg", "docsrs"])
+            .args([
+                "-Zunstable-options", "--output-format=json",
+                "--",
+                "--cfg", "docsrs",
+                "--cap-lints", "allow",
+            ])
             .args(self.config.rustdoc_args)
             .env("DOCSRS", "")
             .env("CARGO_ENCODED_RUSTFLAGS", self.config.rustc_args.join("\x1f"))
-            .stdout(Stdio::null());
-        let Output { status, stderr, .. } = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Output { status, .. } = cmd
             .output().await
             .context("failed to launch `cargo rustdoc`")?;
-        if !status.success() {
-            bail!("`cargo rustdoc` failed;\ncommand: {cmd:#?}\noutput:\n{}",
-                String::from_utf8_lossy(&stderr));
-        }
+        ensure!(status.success(), CompilationFailed);
 
         let mut docs_path = target_directory.join("doc");
         docs_path.push(&*self.name);

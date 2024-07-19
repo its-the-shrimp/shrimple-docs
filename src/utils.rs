@@ -17,6 +17,7 @@ pub const OK: Result = Ok(());
 pub const INVERT: &str = "\x1b[7m";
 pub const BOLD: &str = "\x1b[1m";
 pub const GREEN: &str = "\x1b[32m";
+pub const YELLOW: &str = "\x1b[33m";
 pub const NOSTYLE: &str = "\x1b[0m";
 pub const PREVLINE: &str = "\x1b[1F";
 pub const NL: &str = "\x1b[1E\x1b[0G";
