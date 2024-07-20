@@ -35,7 +35,7 @@ use {
         ExecutableCommand,
         QueueableCommand,
     },
-    std::{env::args_os, io::{stdin, stdout, Read, Write}, mem::take, panic},
+    std::{env::args_os, io::{stdin, stdout, Read, Write}, mem::take, panic, path::PathBuf},
 };
 
 fn next_key_event() -> Result<KeyEvent> {
@@ -336,7 +336,7 @@ async fn main_inner(
     r#in: &mut (impl Read + Send),
     out: &mut (impl Write + Send),
 ) -> Result {
-    let docs = Docs::new(r#in, out, args.offline).await?;
+    let docs = Docs::new(r#in, out, args.offline, args.collect_failures).await?;
     let mut ctx = Ctx::new(&docs)?;
     enable_raw_mode()?;
     out.queue(ScrollUp(ctx.window_height))?
@@ -360,19 +360,43 @@ async fn main_inner(
     }
 }
 
+const USAGE: &str = "\
+Browse Rust documentation right in the terminal
+
+Usage: shrimple-docs [options]
+
+Options:
+    --offline             Run without accessing the network
+    --collect-failures    For every crate that couldn't be documented,
+                          save the stderr from its compilation in the current crate's target folder
+    -h, --help    Print help
+";
+
 struct Args {
     offline: bool,
+    collect_failures: bool,
 }
 
 impl Args {
-    fn parse() -> Result<Self> {
+    fn parse(out: &mut impl Write) -> Result<Self> {
         let mut args = args_os();
+        let mut res = Self {
+            offline: false,
+            collect_failures: false,
+        };
         let _program_name = args.next().context("no program name provided to `shrimple-docs`")?;
-        let offline = args.next().is_some_and(|x| x == "--offline");
-        if let Some(extra) = args.next() {
-            bail!("extra arguments starting from {extra:?}");
+        for arg in args {
+            match arg.as_encoded_bytes() {
+                b"--offline" => res.offline = true,
+                b"--collect-failures" => res.collect_failures = true,
+                b"-h" | b"--help" => {
+                    write!(out, "{USAGE}")?;
+                    bail!(Exit)
+                }
+                _ => bail!("unknown argument: {}", PathBuf::from(arg).display())
+            }
         }
-        Ok(Self { offline })
+        Ok(res)
     }
 }
 
@@ -388,7 +412,7 @@ async fn main() -> Result {
     }));
     let mut stdout = stdout();
     let mut stdin = stdin();
-    let args = Args::parse()?;
+    let args = Args::parse(&mut stdout)?;
     stdout.execute(SavePosition)?.execute(DisableLineWrap)?;
     let res = main_inner(args, &mut stdin, &mut stdout).await;
     disable_raw_mode()?;

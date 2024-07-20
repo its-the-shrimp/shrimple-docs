@@ -109,7 +109,7 @@ impl<W: Write> Formatter<W> {
 }
 
 impl<W: Write> Visitor for Formatter<W> {
-    fn visit_lifetime(&mut self, x: &String) -> Result {
+    fn visit_string(&mut self, x: &String) -> Result {
         write!(self.0, "{x}").map_err(Into::into)
     }
 
@@ -126,7 +126,7 @@ impl<W: Write> Visitor for Formatter<W> {
     fn visit_dyn_trait(&mut self, x: &DynTrait) -> Result {
         write!(self.0, "dyn ")?;
         self.print_with_sep(Self::visit_poly_trait, "", &x.traits, ", ", "")?;
-        self.maybe_print(Self::visit_lifetime, " + ", &x.lifetime, "")?;
+        self.maybe_print(Self::visit_string, " + ", &x.lifetime, "")?;
         OK
     }
 
@@ -310,7 +310,12 @@ impl<W: Write> Visitor for Formatter<W> {
                 }
                 self.visit_path(trait_)?;
             }
-            GenericBound::Outlives(lifetime) => self.visit_lifetime(lifetime)?,
+            GenericBound::Outlives(lifetime) => self.visit_string(lifetime)?,
+            GenericBound::Use(generics) => {
+                write!(self.0, "<")?;
+                self.print_with_sep(Self::visit_string, "", generics, ", ", "")?;
+                write!(self.0, ">")?;
+            }
         }
         OK
     }
@@ -318,8 +323,8 @@ impl<W: Write> Visitor for Formatter<W> {
     fn visit_generic_param_def(&mut self, x: &GenericParamDef) -> Result {
         match &x.kind {
             GenericParamDefKind::Lifetime { outlives } => {
-                self.visit_lifetime(&x.name)?;
-                self.print_with_sep(Self::visit_lifetime, ": ", outlives, " + ", "")?;
+                self.visit_string(&x.name)?;
+                self.print_with_sep(Self::visit_string, ": ", outlives, " + ", "")?;
             }
             GenericParamDefKind::Type { bounds, default, .. } => {
                 write!(self.0, "{}", x.name)?;
@@ -348,9 +353,9 @@ impl<W: Write> Visitor for Formatter<W> {
                 self.print_with_sep(Self::visit_generic_bound, ": ", bounds, " + ", "")?;
             }
 
-            WherePredicate::RegionPredicate { lifetime, bounds } => {
-                self.visit_lifetime(lifetime)?;
-                self.print_with_sep(Self::visit_generic_bound, ": ", bounds, " + ", "")?;
+            WherePredicate::LifetimePredicate { lifetime, outlives } => {
+                self.visit_string(lifetime)?;
+                self.print_with_sep(Self::visit_string, ": ", outlives, " + ", "")?;
             }
 
             WherePredicate::EqPredicate { lhs, rhs } => {

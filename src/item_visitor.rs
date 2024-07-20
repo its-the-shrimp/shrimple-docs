@@ -47,7 +47,7 @@ use {
 		Visibility,
 		WherePredicate,
     },
-    crate::{docs::{FnArg, Infer, Lifetime}, utils::{Result, OK}},
+    crate::{docs::{FnArg, Infer}, utils::{Result, OK}},
 };
 
 macro_rules! func {
@@ -141,7 +141,7 @@ func! {
     }
 
     for GenericArg: |v, x| -> match x {
-        GenericArg::Lifetime(lifetime) => v.visit_lifetime(lifetime)?,
+        GenericArg::Lifetime(lifetime) => v.visit_string(lifetime)?,
         GenericArg::Infer => v.visit_infer(Infer.into())?,
         GenericArg::Type(r#type) => v.visit_type(r#type)?,
         GenericArg::Const(r#const) => v.visit_constant(r#const)?,
@@ -173,7 +173,10 @@ func! {
                 v.visit_generic_param_def(x)?;
             }
         }
-        GenericBound::Outlives(lifetime) => v.visit_lifetime(lifetime)?,
+        GenericBound::Outlives(lifetime) => v.visit_string(lifetime)?,
+        GenericBound::Use(generics) => for x in generics {
+            v.visit_string(x)?;
+        }
     }
 
     for GenericParamDef: |v, GenericParamDef { kind, .. }| -> match kind {
@@ -268,7 +271,7 @@ func! {
         }
     }
 
-    for Lifetime: |_, _| -> {}
+    for String: |_, _| -> {}
 
     for Module: |v, Module { items, .. }| -> for x in items {
         v.visit_id(x)?;
@@ -431,8 +434,8 @@ func! {
                 v.visit_generic_param_def(x)?;
             }
         }
-        WherePredicate::RegionPredicate { bounds, .. } => for x in bounds {
-            v.visit_generic_bound(x)?;
+        WherePredicate::LifetimePredicate { outlives, .. } => for x in outlives {
+            v.visit_string(x)?;
         }
         WherePredicate::EqPredicate { lhs, rhs } => {
             v.visit_type(lhs)?;

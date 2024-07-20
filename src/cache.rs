@@ -17,8 +17,8 @@ static CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[allow(clippy::assertions_on_constants)] // TODO: remove in 1.81
 const CACHE_FILENAME: &str = {
-    assert!(FORMAT_VERSION == 30);
-    "30.json"
+    assert!(FORMAT_VERSION == 32);
+    "32.json"
 };
 
 pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc<str>, Item)>>> {

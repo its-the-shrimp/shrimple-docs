@@ -9,7 +9,18 @@ use {
     serde::Deserialize,
     serde_json::Value,
     std::{
-        collections::{HashMap, HashSet}, env::temp_dir, ffi::OsStr, fmt::{Display, Formatter}, fs::File, io::{BufReader as SyncBufReader, Read, Write}, mem::take, path::{Path, PathBuf}, process::{Output, Stdio}, ptr::{addr_of, addr_of_mut}, sync::Arc, vec
+        collections::{HashMap, HashSet},
+        env::temp_dir,
+        ffi::OsStr,
+        fmt::{Display, Formatter},
+        fs::{self, File},
+        io::{BufReader as SyncBufReader, Read, Write},
+        mem::take,
+        path::{Path, PathBuf},
+        process::{Output, Stdio},
+        ptr::{addr_of, addr_of_mut},
+        sync::Arc,
+        vec,
     },
     tokio::{io::{AsyncBufReadExt, AsyncReadExt, BufReader}, process::Command, try_join},
 };
@@ -32,8 +43,6 @@ impl<'res> From<Infer> for &'res mut Infer {
         unsafe { &mut *addr_of_mut!(value) }
     }
 }
-
-pub type Lifetime = String;
 
 #[derive(Debug, Deserialize)]
 struct Dep<'src> {
@@ -81,10 +90,55 @@ pub struct DocsGen {
     packages: vec::IntoIter<Documentable>,
     toolchain: Arc<str>,
     target_directory: PathBuf,
+    offline: bool,
+    collect_failures: bool,
 }
 
 impl DocsGen {
-    pub async fn document_next(&mut self, out: &mut (impl Write + Send), offline: bool)
+    async fn new(
+        toolchain: Arc<str>,
+        offline: bool,
+        collect_failures: bool,
+    ) -> Result<Self> {
+        let Output { status, stdout, .. } = Command::new("rustup")
+            .args(["run", &toolchain, "cargo", "metadata", "--format-version=1"])
+            .stderr(Stdio::inherit())
+            .output().await?;
+        ensure!(status.success(), "`cargo metadata` failed");
+
+        let mut metadata: CargoMetadata = serde_json::from_slice(&stdout)?;
+        let packages_in_tree = get_packages_in_tree(&toolchain).await?;
+        metadata.packages.retain(|package| packages_in_tree.contains(&*package.name));
+
+        let deps = metadata.packages.iter_mut()
+            .find(|x| x.id == metadata.resolve.root)
+            .map(|x| take(&mut x.dependencies))
+            .context("couldn't find the root package")?;
+        let mut packages: Vec<Documentable> = metadata.packages.into_iter()
+            .map(Documentable::try_from)
+            .try_collect()?;
+
+        for Dep { name, features } in deps {
+            if features.is_empty() { continue }
+        
+            let dep = packages.iter_mut().find(|x| &*x.name == name)
+                .with_context(|| format!("failed to unify dependency features: package {name:?} \
+                                          not found"))?;
+            if !dep.config.all_features {
+                dep.config.features.extend(features.into_iter().map(Into::into));
+            }
+        }
+
+        Ok(Self {
+            packages: packages.into_iter(),
+            toolchain,
+            target_directory: metadata.target_directory,
+            offline,
+            collect_failures,
+        })
+    }
+
+    pub async fn document_next(&mut self, out: &mut (impl Write + Send))
         -> Result<Option<Vec<(Arc<str>, Item)>>>
     {
         let Some(next) = self.packages.next() else {
@@ -92,7 +146,12 @@ impl DocsGen {
         };
         let name = next.name.clone();
         writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
-        match next.document(offline, &self.toolchain, &self.target_directory).await {
+        match next.document(
+            self.offline,
+            self.collect_failures,
+            &self.toolchain,
+            &self.target_directory,
+        ).await {
             Ok(x) => Ok(Some(x)),
             Err(e) if e.is::<CompilationFailed>() => {
                 writeln!(out, "{YELLOW}{BOLD}        Failed{NOSTYLE} to document `{name}`")?;
@@ -189,7 +248,7 @@ fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Arc<str>, Item)>> {
 
     let mut id_normaliser = IdNormaliser {
         paths: &docs.paths,
-        crate_name: path.file_name().and_then(OsStr::to_str)
+        crate_name: path.file_stem().and_then(OsStr::to_str)
             .context("no crate name extracted from the path to the JSON file")?,
         crates: &docs.external_crates,
         temp: String::new(),
@@ -263,6 +322,7 @@ impl Documentable {
     async fn document(
         self,
         offline: bool,
+        collect_failures: bool,
         toolchain: impl AsRef<str> + Send,
         target_directory: impl AsRef<Path> + Send,
     ) -> Result<Vec<(Arc<str>, Item)>> {
@@ -293,12 +353,18 @@ impl Documentable {
             .args(self.config.rustdoc_args)
             .env("DOCSRS", "")
             .env("CARGO_ENCODED_RUSTFLAGS", self.config.rustc_args.join("\x1f"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let Output { status, .. } = cmd
+            .stdout(Stdio::null());
+        let Output { status, stderr, .. } = cmd
             .output().await
             .context("failed to launch `cargo rustdoc`")?;
-        ensure!(status.success(), CompilationFailed);
+        if !status.success() {
+            if collect_failures {
+                let mut dst = target_directory.join(&*self.name);
+                dst.set_extension("stderr");
+                fs::write(dst, stderr)?;
+            }
+            bail!(CompilationFailed)
+        }
 
         let mut docs_path = target_directory.join("doc");
         docs_path.push(&*self.name);
@@ -335,43 +401,6 @@ async fn get_packages_in_tree(toolchain: &str) -> Result<HashSet<Box<str>>> {
     }
 
     Ok(res)
-}
-
-async fn get_gen_ctx(toolchain: Arc<str>) -> Result<DocsGen> {
-    let Output { status, stdout, .. } = Command::new("rustup")
-        .args(["run", &toolchain, "cargo", "metadata", "--format-version=1"])
-        .stderr(Stdio::inherit())
-        .output().await?;
-    ensure!(status.success(), "`cargo metadata` failed");
-
-    let mut metadata: CargoMetadata = serde_json::from_slice(&stdout)?;
-    let packages_in_tree = get_packages_in_tree(&toolchain).await?;
-    metadata.packages.retain(|package| packages_in_tree.contains(&*package.name));
-
-    let deps = metadata.packages.iter_mut()
-        .find(|x| x.id == metadata.resolve.root)
-        .map(|x| take(&mut x.dependencies))
-        .context("couldn't find the root package")?;
-    let mut packages: Vec<Documentable> = metadata.packages.into_iter()
-        .map(Documentable::try_from)
-        .try_collect()?;
-
-    for Dep { name, features } in deps {
-        if features.is_empty() { continue }
-    
-        let dep = packages.iter_mut().find(|x| &*x.name == name)
-            .with_context(|| format!("failed to unify dependency features: package {name:?} \
-                                      not found"))?;
-        if !dep.config.all_features {
-            dep.config.features.extend(features.into_iter().map(Into::into));
-        }
-    }
-
-    Ok(DocsGen {
-        packages: packages.into_iter(),
-        toolchain,
-        target_directory: metadata.target_directory,
-    })
 }
 
 async fn get_std_docs_dir(toolchain: &str) -> Result<PathBuf> {
@@ -448,13 +477,14 @@ impl Docs {
         r#in: &mut (impl Read + Send),
         out: &mut (impl Write + Send),
         offline: bool,
+        collect_failures: bool,
     ) -> Result<Self> {
         let mut index = HashMap::new();
         let toolchain = get_nightly_toolchain(r#in, out).await?;
 
         writeln!(out, "{GREEN}{BOLD}    Extracting{NOSTYLE} crate and system metadata")?;
         let (mut ctx, std_docs_dir) = try_join! {
-            get_gen_ctx(toolchain.clone()),
+            DocsGen::new(toolchain.clone(), offline, collect_failures),
             get_std_docs_dir(&toolchain),
         }?;
 
@@ -487,9 +517,9 @@ impl Docs {
         if include_std_docs {
             for entry in std_docs_dir.read_dir()? {
                 let file = entry?.path();
-                let name = Path::new(file.file_stem().context("no standard library name")?)
-                    .display();
-                writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
+                write!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} ")?;
+                out.write_all(file.file_stem().map_or(b"", OsStr::as_encoded_bytes))?;
+                writeln!(out)?;
                 let docs = parse_json_docs(file)?;
                 index.reserve(docs.len());
                 for (id, item) in docs {
@@ -501,7 +531,7 @@ impl Docs {
             }
         }
 
-        while let Some(docs) = ctx.document_next(out, offline).await? {
+        while let Some(docs) = ctx.document_next(out).await? {
             index.reserve(docs.len());
             for (id, item) in docs {
                 if id.bytes().nth(1) != Some(b':') {
