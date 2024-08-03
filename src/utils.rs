@@ -3,12 +3,13 @@ use {
     std::{
         cmp::Ordering,
         error::Error,
-        fmt::{Debug, Display, Formatter, Write},
+        fmt::{Debug, Display, Formatter},
         ops::Deref,
         ptr::copy_nonoverlapping,
         slice,
         str::from_utf8_unchecked,
-    }
+    },
+    paste::paste,
 };
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
@@ -24,14 +25,18 @@ pub const NL: &str = "\x1b[1E\x1b[0G";
 pub const CLEARLINE: &str = "\x1b[2K\r";
 pub const NULL_EVENT: KeyEvent = KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
 
-pub trait OptionExt<T> {
-    fn inspect_mut(self, f: impl FnOnce(&mut T)) -> Self;
+pub fn cmp<T: Ord>(a: &T, b: &T) -> Ordering {
+    a.cmp(b)
 }
 
-impl<T> OptionExt<T> for Option<T> {
-    fn inspect_mut(mut self, f: impl FnOnce(&mut T)) -> Self {
-        if let Some(x) = &mut self {
-            f(x);
+pub trait OptionExt {
+    fn inspect_none(self, f: impl FnOnce()) -> Self;
+}
+
+impl<T> OptionExt for Option<T> {
+    fn inspect_none(self, f: impl FnOnce()) -> Self {
+        if self.is_none() {
+            f();
         }
         self
     }
@@ -52,124 +57,6 @@ pub trait BoolExt {
 impl BoolExt for bool {
     fn pick<T>(self, on_true: T, on_false: T) -> T {
         if self {on_true} else {on_false}
-    }
-}
-
-#[derive(Debug)]
-pub struct StringView {
-    content:       String,
-    last_line_len: isize,
-    min_shift:     isize,
-    max_shift:     isize,
-    min_scroll:    isize,
-    max_scroll:    isize,
-    scroll:        isize,
-    shift:         isize,
-}
-
-impl Write for StringView {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.content.push_str(s);
-        for line in s.split_inclusive('\n') {
-            if line.ends_with('\n') {
-                let len = line.len().try_into().unwrap_or(isize::MAX);
-                self.max_shift = self.max_shift.max(self.last_line_len + len);
-                self.last_line_len = 0;
-                self.max_scroll += 1;
-            } else {
-                self.last_line_len = line.len().try_into().unwrap_or(isize::MAX);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl StringView {
-    pub fn new(content: String, min_shift: isize, min_scroll: isize) -> Self {
-        let mut max_scroll = 0;
-        let mut last_line_len = 0isize;
-        let max_shift = content.lines()
-            .inspect(|line| {
-                max_scroll += 1;
-                last_line_len = line.len().try_into().unwrap_or(isize::MAX);
-            })
-            .map(str::len)
-            .max()
-            .map_or(0, |x| x.try_into().unwrap_or(isize::MAX));
-        Self {
-            content, min_shift, max_shift, min_scroll, max_scroll, last_line_len,
-            scroll: min_scroll, shift: min_shift, 
-        }
-    }
-
-    pub const fn scroll(&self) -> isize {
-        self.scroll
-    }
-
-    pub fn set_scroll(&mut self, scroll: isize) {
-        self.scroll = scroll.clamp(self.min_scroll, self.max_scroll);
-    }
-
-    pub const fn shift(&self) -> isize {
-        self.shift
-    }
-
-    pub fn set_shift(&mut self, shift: isize) {
-        self.shift = shift.clamp(self.min_shift, self.max_shift);
-    }
-
-    /// Returns a boolean indicating whether the view needs needs to be re-rendered
-    pub fn process_key_event(&mut self, event: &KeyEvent) -> bool {
-        match event.code {
-            KeyCode::Down => self.scroll = match event.modifiers {
-                KeyModifiers::NONE => self.scroll.saturating_add(1).min(self.max_scroll),
-                KeyModifiers::SHIFT => self.max_scroll,
-                _ => return false,
-            },
-
-            KeyCode::Up => self.scroll = match event.modifiers {
-                KeyModifiers::NONE => self.scroll.saturating_sub(1).max(self.min_scroll),
-                KeyModifiers::SHIFT => self.min_scroll,
-                _ => return false,
-            },
-
-            KeyCode::Right => self.shift = match event.modifiers {
-                KeyModifiers::NONE => self.shift.saturating_add(1).min(self.max_shift),
-                KeyModifiers::SHIFT => self.max_shift,
-                _ => return false,
-            },
-
-            KeyCode::Left => self.shift = match event.modifiers {
-                KeyModifiers::NONE => self.shift.saturating_sub(1).max(self.min_shift),
-                KeyModifiers::SHIFT => self.min_shift,
-                _ => return false,
-            },
-
-            _ => return false,
-        }
-        true
-    }
-
-    pub fn print(
-        &self,
-        out: &mut impl std::io::Write,
-        width: u16,
-        height: u16,
-    ) -> Result {
-        for _ in self.scroll .. 0 {
-            write!(out, "{NL}")?;
-        }
-        let shift = self.shift.try_into().unwrap_or(0usize).min(width.into());
-        for line in self.content.lines()
-            .skip(self.scroll.try_into().unwrap_or(0))
-            .take(height.into())
-        {
-            for _ in self.shift .. 0 {
-                out.write_all(b" ")?;
-            }
-            write!(out, "{}{NL}", line.get(shift..).unwrap_or(""))?;
-        }
-        Ok(())
     }
 }
 
@@ -262,17 +149,20 @@ impl<const CAP: usize> Default for ShortStr<CAP> {
     }
 }
 
-impl<const CAP: usize> Write for ShortStr<CAP> {
+impl<const CAP: usize> std::fmt::Write for ShortStr<CAP> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        #[allow(clippy::cast_possible_truncation)]
+        let cap = const { CAP as u8 };
+
         let s_len: u8 = s.len().try_into().map_err(|_| std::fmt::Error)?;
-        if self.len() + s_len as usize > CAP {
+        let Some(new_len) = self.len.checked_add(s_len).filter(|&x| x <= cap) else {
             return Err(std::fmt::Error);
-        }
+        };
         // SAFETY: the condition above asserts that `self` has at least `s_len` free bytes
         unsafe {
             let rest = self.buf.as_mut_ptr().add(self.len());
             copy_nonoverlapping(s.as_ptr(), rest, s_len as usize);
-            self.len += s_len;
+            self.len = new_len;
         }
         Ok(())
     }
@@ -288,4 +178,104 @@ impl<const CAP: usize> ShortStr<CAP> {
         // write `&str`s to it.
         unsafe { from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize)) }
     }
+}
+
+/// Returns the index in `buf` 1 byte after the end of `rem` lines, updating `rem` according to how
+/// many lines the consumed slice encompasses.
+fn get_rem_lines_end(buf: &[u8], rem: &mut usize) -> usize {
+    match rem.checked_sub(1) {
+        None => 0,
+        Some(n) => buf
+            .windows(NL.len())
+            .enumerate()
+            .filter(|(_, seq)| *seq == NL.as_bytes())
+            .inspect(|_| *rem = rem.saturating_sub(1))
+            .nth(n)
+            .map_or(buf.len(), |(i, _)| i.wrapping_add(NL.len())),
+    }
+}
+
+pub struct SkipLines<Writer> {
+    pub inner: Writer,
+    rem: usize,
+}
+
+impl<Writer: std::io::Write> std::io::Write for SkipLines<Writer> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(&buf[get_rem_lines_end(buf, &mut self.rem) ..])
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(&buf[get_rem_lines_end(buf, &mut self.rem) ..])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub struct FirstLines<Writer> {
+    pub inner: Writer,
+    rem: usize,
+}
+
+impl<Writer: std::io::Write> std::io::Write for FirstLines<Writer> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(&buf[.. get_rem_lines_end(buf, &mut self.rem)])
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(&buf[.. get_rem_lines_end(buf, &mut self.rem)])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+pub trait WriteExt: std::io::Write + Sized {
+    fn skip_lines(self, n_lines: usize) -> SkipLines<Self> {
+        SkipLines { inner: self, rem: n_lines }
+    }
+
+    fn first_lines(self, n_lines: usize) -> FirstLines<Self> {
+        FirstLines { inner: self, rem: n_lines }
+    }
+}
+
+impl<Writer: std::io::Write> WriteExt for Writer {}
+
+macro_rules! impl_int_exts {
+    ($trait_name:ident : $($int:ty),+ as $ptrsized_int:ty) => {
+        paste! {
+            #[allow(dead_code)]
+            pub trait $trait_name {
+                fn [<into_ $ptrsized_int>](self) -> $ptrsized_int;
+                fn r#if(self, condition: bool) -> Self;
+            }
+
+            $(
+                #[cfg(any(target_pointer_width = "64", target_pointer_width = "32"))]
+                impl $trait_name for $int {
+                    fn [<into_ $ptrsized_int>](self) -> $ptrsized_int {
+                        self as $ptrsized_int
+                    }
+
+                    fn r#if(self, condition: bool) -> Self {
+                        self.wrapping_mul(Self::from(condition))
+                    }
+                }
+            )+
+        }
+    };
+}
+
+impl_int_exts!(IntExt: i16, i32 as isize);
+impl_int_exts!(UIntExt: u16, u32 as usize);
+
+#[macro_export]
+macro_rules! errfmt {
+    ($fmt:literal, $($arg:expr),+) => {
+        || format!(concat!("failed to ", $fmt), $($arg),+)
+    };
 }

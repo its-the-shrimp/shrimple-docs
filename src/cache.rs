@@ -1,5 +1,5 @@
 use {
-    crate::utils::{OptionExt, Result, OK},
+    crate::utils::{Result, OK},
     anyhow::Context,
     dirs::cache_dir,
     rustdoc_types::{Item, FORMAT_VERSION},
@@ -7,15 +7,17 @@ use {
         fs::{create_dir_all, remove_file, File},
         io::{BufReader, BufWriter},
         path::PathBuf,
-        sync::{Arc, OnceLock},
+        sync::{Arc, LazyLock},
     },
 };
 
 // The cache directory structure is "/<registry>/<name>/<version>/<format_version>.json"
-// TODO: replace with LazyLock in 1.80
-static CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CACHE_ROOT: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let mut res = cache_dir()?;
+    res.push("shrimple-docs");
+    Some(res)
+});
 
-#[allow(clippy::assertions_on_constants)] // TODO: remove in 1.81
 const CACHE_FILENAME: &str = {
     assert!(FORMAT_VERSION == 32);
     "32.json"
@@ -23,7 +25,6 @@ const CACHE_FILENAME: &str = {
 
 pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc<str>, Item)>>> {
     let mut cache_path = CACHE_ROOT
-        .get_or_init(|| cache_dir().inspect_mut(|x| x.push("shrimple-docs")))
         .clone()
         .context("failed to get the cache directory of the system")?;
 
@@ -40,7 +41,6 @@ pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc
 
 pub fn store(items: &[(Arc<str>, Item)], registry: &str, name: &str, version: &str) -> Result {
     let mut cache_path = CACHE_ROOT
-        .get_or_init(|| cache_dir().inspect_mut(|x| x.push("shrimple-docs")))
         .clone()
         .context("failed to get the cache directory of the system")?;
 

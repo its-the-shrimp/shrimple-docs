@@ -1,48 +1,21 @@
 use {
-    std::{fmt::{Display, Write}, mem::take},
-    anyhow::{bail, Context},
-    rustdoc_types::{
-        Abi,
-        Constant,
-		DynTrait,
-		Enum,
-		FnDecl,
-		Function,
-		FunctionPointer,
-		GenericArgs,
-		GenericBound,
-		GenericParamDef,
-		GenericParamDefKind,
-		Generics,
-		Header,
-		Import,
-		Item,
-		ItemEnum,
-		MacroKind,
-		Path,
-		PolyTrait,
-		Primitive,
-		ProcMacro,
-		Static,
-		Struct,
-		StructKind,
-		Trait,
-		TraitAlias,
-		TraitBoundModifier,
-		Type,
-		TypeAlias,
-		TypeBinding,
-		TypeBindingKind,
-		Union,
-		VariantKind,
-		Visibility,
-		WherePredicate,
-    },
     crate::{
         docs::{Docs, Infer},
         item_visitor::{visit_type, Visitor},
-        utils::{BoolExt, Result, OK, BOLD, NOSTYLE},
+        utils::{
+            BoolExt, Result, BOLD,
+            NOSTYLE, OK,
+        },
     },
+    anyhow::{bail, Context},
+    rustdoc_types::{
+        Abi, Constant, DynTrait, Enum, FnDecl, Function, FunctionPointer, GenericArgs,
+        GenericBound, GenericParamDef, GenericParamDefKind, Generics, Header, Import, Item,
+        ItemEnum, MacroKind, Path, PolyTrait, Primitive, ProcMacro, Static, Struct, StructKind,
+        Trait, TraitAlias, TraitBoundModifier, Type, TypeAlias, TypeBinding, TypeBindingKind,
+        Union, Variant, VariantKind, Visibility, WherePredicate,
+    },
+    std::{fmt::{Display, Write}, mem::take},
 };
 
 struct Formatter<W>(W);
@@ -385,11 +358,82 @@ impl<W: Write> Visitor for Formatter<W> {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
+pub(super) fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
     let mut fmt = Formatter(out);
 
     match &item.inner {
-        ItemEnum::Impl(_) | ItemEnum::Variant(_) | ItemEnum::StructField(_) => {}
+        ItemEnum::Impl(_) => {},
+
+        ItemEnum::Variant(Variant { kind, discriminant }) => {
+            let name = item.name.as_ref().context("no enum variant name")?;
+            write!(fmt.0, "{name}")?;
+            match kind {
+                VariantKind::Plain => {},
+
+                VariantKind::Tuple(fields) => {
+                    write!(fmt.0, "(")?;
+                    let [mut fields_stripped, mut first] = [false, true];
+                    for field_id in fields {
+                        let Some(field_id) = field_id else {
+                            fields_stripped = true;
+                            continue;
+                        };
+                        let Some(field) = docs.index().get(&*field_id.0) else {
+                            bail!("no variant field found");
+                        };
+                        let ItemEnum::StructField(field_ty) = &field.inner else {
+                            bail!("no variant field type found");
+                        };
+                        if !take(&mut first) {
+                            write!(fmt.0, ", ")?;
+                        }
+                        fmt.visit_visibility(&field.visibility)?;
+                        fmt.visit_type(field_ty)?;
+                    }
+                    if fields_stripped {
+                        write!(fmt.0, "{}...", first.pick("", ", "))?;
+                    }
+                    write!(fmt.0, ")")?;
+                }
+
+                VariantKind::Struct { fields, fields_stripped } => {
+                    write!(fmt.0, " {{")?;
+                    if !fields.is_empty() || *fields_stripped {
+                        writeln!(fmt.0)?;
+                    }
+                    for field_id in fields {
+                        let Some(field) = docs.index().get(&*field_id.0) else {
+                            bail!("no variant field found");
+                        };
+                        let Some(field_name) = &field.name else {
+                            bail!("no variant field name found");
+                        };
+                        let ItemEnum::StructField(field_ty) = &field.inner else {
+                            bail!("no variant field type found");
+                        };
+                        write!(fmt.0, "    ")?;
+                        fmt.visit_visibility(&field.visibility)?;
+                        write!(fmt.0, "{field_name}: ")?;
+                        fmt.visit_type(field_ty)?;
+                        writeln!(fmt.0, ",")?;
+                    }
+                    if *fields_stripped {
+                        writeln!(fmt.0, "    ...")?;
+                    }
+                    write!(fmt.0, "}}")?;
+                }
+            }
+            
+            if let Some(discriminant) = discriminant {
+                write!(fmt.0, " = {}", discriminant.value)?;
+            }
+        }
+
+        ItemEnum::StructField(ty) => {
+            let name = item.name.as_ref().context("no struct field name")?;
+            write!(fmt.0, "{name}: ")?;
+            fmt.visit_type(ty)?;
+        }
 
         ItemEnum::Module(_) => {
             let name = item.name.as_ref().context("no module name")?;
@@ -726,6 +770,5 @@ pub fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Result {
         }
     }
 
-    write!(fmt.0, "\n{}", item.docs.as_deref().unwrap_or(""))?;
     OK
 }

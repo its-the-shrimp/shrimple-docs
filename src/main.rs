@@ -1,5 +1,5 @@
 mod utils;
-mod item_printer;
+mod docview;
 mod docs;
 mod item_visitor;
 mod cache;
@@ -7,20 +7,12 @@ mod cache;
 use {
     crate::{
         docs::{Docs, SearchResult},
-        item_printer::print_item,
-        utils::{Exit, Result, StringView, BOLD, INVERT, NL, NOSTYLE, NULL_EVENT, OK},
+        docview::DocView,
+        utils::{Exit, Result, BOLD, INVERT, NL, NOSTYLE, NULL_EVENT, OK},
     },
     anyhow::{bail, Context},
     crossterm::{
-        cursor::{
-            MoveLeft,
-            MoveToColumn,
-            MoveToNextLine,
-            MoveToPreviousLine,
-            MoveToRow,
-            RestorePosition,
-            SavePosition,
-        },
+        cursor::{MoveToPreviousLine, MoveToRow, RestorePosition, SavePosition},
         event::{Event, KeyCode, KeyEvent, KeyModifiers},
         terminal::{
             disable_raw_mode,
@@ -35,7 +27,14 @@ use {
         ExecutableCommand,
         QueueableCommand,
     },
-    std::{env::args_os, io::{stdin, stdout, Read, Write}, mem::take, panic, path::PathBuf},
+    std::{
+        env::args_os,
+        io::{stdin, stdout, Read, Write},
+        mem::take,
+        num::NonZero,
+        panic,
+        path::PathBuf,
+    },
 };
 
 fn next_key_event() -> Result<KeyEvent> {
@@ -68,7 +67,7 @@ impl<'docs> Ctx<'docs> {
 
     async fn print_modes(&mut self, out: &mut (impl Write + Send)) -> Result {
         out.queue(MoveToRow(u16::MAX - 1))?
-            .queue(MoveToPreviousLine(self.window_height - 2))?
+            .queue(MoveToPreviousLine(self.window_height.saturating_sub(2)))?
             .queue(Clear(FromCursorDown))?;
         write!(out, "{BOLD}Mode{NOSTYLE}: ")?;
         for mode in self.modes.iter().rev() {
@@ -116,7 +115,7 @@ impl SearchMode {
     }
 
     fn print_results(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        let n = ctx.window_height - 5;
+        let n = ctx.window_height.saturating_sub(5);
         out.queue(SavePosition)?;
 
         if self.results.is_empty() {
@@ -147,60 +146,59 @@ impl SearchMode {
     )
         -> Result<Option<Mode>>
     {
-        let n_results = ctx.window_height as usize - 5;
+        let n_results = usize::saturating_sub(ctx.window_height.into(), 5);
 
-        let changed = match event.code {
+        let mut changed = false;
+        match event.code {
             KeyCode::Up => {
                 if event.modifiers == KeyModifiers::SHIFT {
                     self.selected = Some(0);
                     self.shift = 0;
                 } else {
                     self.selected = self.selected.and_then(|x| x.checked_sub(1));
-                    if self.selected.is_some_and(|s| (s - self.shift) < n_results / 2) {
+                    if self.selected.is_some_and(|s| s.wrapping_sub(self.shift) < n_results / 2) {
                         self.shift = self.shift.saturating_sub(1);
                     }
                 }
-                false
             }
 
-            KeyCode::Down => {
+            KeyCode::Down => if let Some(res_len) = NonZero::new(self.results.len()) {
                 if event.modifiers == KeyModifiers::SHIFT {
-                    self.selected = Some(self.results.len() - 1);
-                    self.shift = self.results.len() - n_results;
+                    self.selected = self.results.len().checked_sub(1);
+                    self.shift = self.results.len().saturating_sub(n_results);
                 } else {
-                    let new = self.selected.map_or(0, |x| (x + 1) % self.results.len());
+                    let new = self.selected.map_or(0, |x| x.wrapping_add(1) % res_len);
                     if new == 0 {
                         self.shift = 0;
-                    } else if new - self.shift > n_results / 2 {
-                        self.shift = (self.shift + 1).min(self.results.len() - n_results);
+                    } else if new.wrapping_sub(self.shift) > n_results / 2 {
+                        self.shift = self.shift
+                            .wrapping_add(1)
+                            .min(res_len.get().saturating_sub(n_results));
                     }
                     self.selected = Some(new);
                 }
-                false
             }
 
             KeyCode::Enter => if let Some(selected) = self.selected {
                 let docview = DocViewMode::new(&self.results[selected].id, ctx)?;
                 return Ok(Some(Mode::DocView(docview)))
             } else {
-                true
+                changed = true;
             }
 
             KeyCode::Char(ch) if ch != '\n' => {
                 self.query.push(ch);
                 write!(out, "{ch}")?;
-                false
             }
 
             KeyCode::Backspace => {
                 if self.query.pop().is_some() {
                     write!(out, "\x1b[1D \x1b[1D")?;
                 }
-                false
             }
 
             _ => return Ok(None),
-        };
+        }
         out.queue(Clear(FromCursorDown))?;
 
         if changed {
@@ -213,23 +211,22 @@ impl SearchMode {
 
 struct DocViewMode {
     id: String,
-    view: Option<StringView>,
+    id_changed: bool,
+    view: Option<DocView>,
 }
 
 impl DocViewMode {
     const INPUT_PREFIX: &'static str = "view \u{2192} ";
 
-    fn get_view(id: &str, ctx: &Ctx) -> Result<Option<StringView>> {
+    fn get_view(id: &str, ctx: &Ctx) -> Result<Option<DocView>> {
         let Some(item) = ctx.docs.index().get(id) else {
             return Ok(None);
         };
-        let mut content = StringView::new(String::new(), -1, -1);
-        print_item(item, ctx.docs, &mut content)?;
-        Ok(Some(content))
+        Ok(Some(DocView::new(item, ctx.docs)?))
     }
 
     fn new(id: &str, ctx: &Ctx) -> Result<Self> {
-        Ok(Self { view: Self::get_view(id, ctx)?, id: id.to_owned() })
+        Ok(Self { view: Self::get_view(id, ctx)?, id: id.to_owned(), id_changed: false })
     }
 
     fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
@@ -238,16 +235,15 @@ impl DocViewMode {
     }
 
     fn print_docs(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        out.queue(SavePosition)?
-            .queue(MoveToNextLine(1))?
-            .queue(MoveToColumn(0))?
+        out
+            .queue(MoveToRow(u16::MAX - 1))?
+            .queue(MoveToPreviousLine(ctx.window_height.saturating_sub(4)))?
             .queue(Clear(FromCursorDown))?;
         if let Some(view) = &self.view {
-            view.print(out, ctx.window_height - 4, ctx.window_width)?;
+            view.print(out, ctx.window_width, ctx.window_height.saturating_sub(4))?;
         } else {
-           write!(out, "Not Found")?;
+            write!(out, "Not Found")?;
         }
-        out.queue(RestorePosition)?;
         OK
     }
 
@@ -255,32 +251,31 @@ impl DocViewMode {
         -> Result<Option<Mode>>
     {
         let mut changed = self.view.as_mut().is_some_and(|x| x.process_key_event(event));
-        changed |= match event.code {
-            KeyCode::Enter => {
+        match event.code {
+            KeyCode::Enter => if self.id_changed {
                 let mut new_view = Self::get_view(&self.id, ctx)?;
                 if let (Some(new), Some(old)) = (&mut new_view, &mut self.view) {
-                    new.set_scroll(old.scroll());
-                    new.set_shift(old.shift());
+                    new.set_cursor_x(old.cursor_x());
+                    new.set_cursor_y(old.cursor_y());
                 }
                 self.view = new_view;
-                true
+                changed = true;
             }
 
             KeyCode::Char(ch) if ch != '\n' => {
                 self.id.push(ch);
                 write!(out, "{ch}")?;
-                true
+                self.id_changed = true;
+                changed = true;
             }
 
             KeyCode::Backspace => if self.id.pop().is_some() {
-                out.queue(MoveLeft(1))?;
-                write!(out, " ")?;
-                true
-            } else {
-                false
+                write!(out, "\x1b[1D \x1b[1D")?;
+                self.id_changed = true;
+                changed = true;
             }
 
-            _ => false,
+            _ => {}
         };
 
         if changed {
