@@ -83,18 +83,24 @@ impl Section {
         }.saturating_add(1)
     }
 
-    fn max_line_len(&self) -> usize {
+    fn _max_line_len(&self, indent: usize) -> usize {
         if !self.expanded {
             return 0;
         }
         match &self.kind {
-            SectionKind::Text { max_line_len, .. } => max_line_len.into_usize(),
+            SectionKind::Text { max_line_len, .. } => max_line_len
+                .into_usize()
+                .saturating_add(indent.wrapping_mul(2)),
             SectionKind::Folder { subsections, .. } => subsections
                 .iter()
-                .map(|s| if s.expanded { s.max_line_len() } else { 0 })
+                .map(|s| if s.expanded { s._max_line_len(indent.wrapping_add(1)) } else { 0 })
                 .max()
                 .unwrap_or(0),
         }
+    }
+
+    fn max_line_len(&self) -> usize {
+        self._max_line_len(1)
     }
 
     fn print(&self, out: &mut impl std::io::Write, indent: usize) -> Result {
@@ -293,6 +299,42 @@ impl DocView {
         self.cursor_y = cursor_y;
     }
 
+    /// The returned integer is the offset from the header line of the section, if it's 0, the
+    /// cursor is on the header line
+    ///
+    /// If the closures returnes `false`, 
+    fn _innermost_hovered_section_mut(
+        &mut self,
+        mut must_break: impl Copy + FnMut(&mut Section) -> bool,
+    ) -> Option<(&mut Section, usize)> {
+        let Ok(rem) = usize::try_from(self.cursor_y) else {
+            return None;
+        };
+
+        self.sections.iter_mut()
+            .try_fold(rem, |rem, section|
+                section.fold_subsection(rem, move |rem, section| 
+                    rem.checked_sub(1)
+                        .and_then(|rem| {
+                            if must_break(section) {
+                                return None;
+                            }
+                            if !section.expanded {
+                                return Some(rem);
+                            }
+                            let SectionKind::Text { n_lines, .. } = section.kind else {
+                                return Some(rem);
+                            };
+                            rem.checked_sub(n_lines.into_usize())
+                        })
+                        .ok_or((section, rem))))
+            .err()
+    }
+
+    fn innermost_hovered_section_mut(&mut self) -> Option<(&mut Section, usize)> {
+        self._innermost_hovered_section_mut(|_| false)
+    }
+
     /// Returns a boolean indicating whether the view needs needs to be re-rendered
     pub fn process_key_event(&mut self, event: &KeyEvent) -> bool {
         match event.code {
@@ -302,8 +344,8 @@ impl DocView {
                     .iter()
                     .map(Section::count_lines)
                     .fold(0, usize::saturating_add)
-                    .saturating_add(self.sections.len())
-                    .try_into().unwrap_or(i32::MAX),
+                    .try_into()
+                    .unwrap_or(i32::MAX),
                 _ => return false,
             },
 
@@ -332,36 +374,10 @@ impl DocView {
                 _ => return false,
             },
 
-            KeyCode::Enter => {
-                let Ok(rem) = usize::try_from(self.cursor_y) else {
-                    return false;
-                };
-
-                let Err((section, rem)) = self.sections.iter_mut()
-                    .try_fold(rem, |rem, section|
-                        section.fold_subsection(rem, |rem, section| 
-                            rem.checked_sub(1)
-                                .and_then(|rem| {
-                                    if !section.expanded {
-                                        return Some(rem);
-                                    }
-                                    let SectionKind::Text { n_lines, .. } = section.kind else {
-                                        return Some(rem);
-                                    };
-                                    rem.checked_sub(n_lines.into_usize())
-                                })
-                                .ok_or((section, rem))))
-                else {
-                    return false;
-                };
-
+            KeyCode::Enter => if let Some((section, 0)) = self.innermost_hovered_section_mut() {
                 section.expanded = !section.expanded;
-                if !section.expanded {
-                    self.cursor_y = self.cursor_y.into_isize()
-                        .wrapping_sub_unsigned(rem)
-                        .try_into()
-                        .unwrap_or(i32::MAX);
-                }
+            } else {
+                return false;
             }
 
             _ => return false,
