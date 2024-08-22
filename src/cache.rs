@@ -19,8 +19,8 @@ static CACHE_ROOT: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 });
 
 const CACHE_FILENAME: &str = {
-    assert!(FORMAT_VERSION == 32);
-    "32.json"
+    assert!(FORMAT_VERSION == 33);
+    "33.json"
 };
 
 pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc<str>, Item)>>> {

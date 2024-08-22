@@ -2,10 +2,7 @@ use {
     crate::{
         docs::{Docs, Infer},
         item_visitor::{visit_type, Visitor},
-        utils::{
-            BoolExt, Result, BOLD,
-            NOSTYLE, OK,
-        },
+        utils::{BoolExt, Result, BOLD, RESET, OK},
     },
     anyhow::{bail, Context},
     rustdoc_types::{
@@ -690,8 +687,6 @@ pub(super) fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Resu
             write!(fmt.0, ";")?;
         }
 
-        ItemEnum::OpaqueTy(_) => todo!(),
-
         ItemEnum::Constant { type_, const_ } => {
             let name = item.name.as_ref().context("no constant name")?;
             write!(fmt.0, "const {name}: ")?;
@@ -742,7 +737,7 @@ pub(super) fn print_item(item: &Item, docs: &Docs, out: &mut impl Write) -> Resu
             }
         }
 
-        ItemEnum::Primitive(Primitive { name, .. }) => write!(fmt.0, "{BOLD}{name}{NOSTYLE}")?,
+        ItemEnum::Primitive(Primitive { name, .. }) => write!(fmt.0, "{BOLD}{name}{RESET}")?,
 
         ItemEnum::AssocConst { type_, default } => {
             let name = item.name.as_ref().context("no associated constant name")?;

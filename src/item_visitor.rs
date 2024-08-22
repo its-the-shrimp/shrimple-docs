@@ -26,7 +26,6 @@ use {
 		Item,
 		ItemEnum,
 		Module,
-		OpaqueTy,
 		Path,
 		PolyTrait,
         Primitive,
@@ -250,7 +249,6 @@ func! {
             ItemEnum::TraitAlias(x) => v.visit_trait_alias(x)?,
             ItemEnum::Impl(x) => v.visit_impl(x)?,
             ItemEnum::TypeAlias(x) => v.visit_type_alias(x)?,
-            ItemEnum::OpaqueTy(x) => v.visit_opaque_ty(x)?,
             ItemEnum::Constant { type_, const_ } => {
                 v.visit_type(type_)?;
                 v.visit_constant(const_)?;
@@ -275,13 +273,6 @@ func! {
 
     for Module: |v, Module { items, .. }| -> for x in items {
         v.visit_id(x)?;
-    }
-
-    for OpaqueTy: |v, OpaqueTy { bounds, generics }| -> {
-        for x in bounds {
-            v.visit_generic_bound(x)?;
-        }
-        v.visit_generics(generics)?;
     }
 
     for Path: |v, Path { id, args, .. }| -> {

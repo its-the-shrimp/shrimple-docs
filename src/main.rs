@@ -1,3 +1,4 @@
+mod shared_str;
 mod utils;
 mod docview;
 mod docs;
@@ -8,7 +9,7 @@ use {
     crate::{
         docs::{Docs, SearchResult},
         docview::DocView,
-        utils::{Exit, Result, BOLD, INVERT, NL, NOSTYLE, NULL_EVENT, OK},
+        utils::{Exit, Result, BACK, BOLD, NL, NULL_EVENT, OK, RESET, REVERSE},
     },
     anyhow::{bail, Context},
     crossterm::{
@@ -69,7 +70,7 @@ impl<'docs> Ctx<'docs> {
         out.queue(MoveToRow(u16::MAX - 1))?
             .queue(MoveToPreviousLine(self.window_height.saturating_sub(2)))?
             .queue(Clear(FromCursorDown))?;
-        write!(out, "{BOLD}Mode{NOSTYLE}: ")?;
+        write!(out, "{BOLD}Mode{RESET}: ")?;
         for mode in self.modes.iter().rev() {
             write!(out, "{} \u{2190} ", mode.name())?;
         }
@@ -95,6 +96,7 @@ impl<'docs> Ctx<'docs> {
     }
 }
 
+#[derive(Debug)]
 struct SearchMode {
     selected: Option<usize>,
     shift: usize,
@@ -123,8 +125,8 @@ impl SearchMode {
         }
 
         for (i, result) in self.results.iter().enumerate().skip(self.shift).take(n.into()) {
-            let invert = if self.selected == Some(i) {INVERT} else {""};
-            write!(out, "{NL}{invert}{i}: {}{NOSTYLE}", result.id)?;
+            let maybe_rev = if self.selected == Some(i) { REVERSE } else { RESET };
+            write!(out, "{NL}{maybe_rev}{i}: {}{RESET}", result.id)?;
         }
 
         out.queue(RestorePosition)?;
@@ -132,8 +134,8 @@ impl SearchMode {
     }
 
     fn init(&self, ctx: &Ctx, out: &mut impl Write) -> Result {
-        write!(out, "{BOLD}<Up/Down>{NOSTYLE} - go 1 line up/down in the results{NL}")?;
-        write!(out, "{BOLD}<Ctrl-Up/Down>{NOSTYLE} - go to the top/bottom of the results{NL}")?;
+        write!(out, "{BOLD}<Up/Down>{RESET} - go 1 line up/down in the results{NL}")?;
+        write!(out, "{BOLD}<Ctrl-Up/Down>{RESET} - go to the top/bottom of the results{NL}")?;
         write!(out, "{}{}", Self::INPUT_PREFIX, self.query)?;
         self.print_results(ctx, out)
     }
@@ -181,7 +183,7 @@ impl SearchMode {
 
             KeyCode::Enter => if let Some(selected) = self.selected {
                 let docview = DocViewMode::new(&self.results[selected].id, ctx)?;
-                return Ok(Some(Mode::DocView(docview)))
+                return Ok(Some(Mode::DocView(docview)));
             } else {
                 changed = true;
             }
@@ -193,7 +195,7 @@ impl SearchMode {
 
             KeyCode::Backspace => {
                 if self.query.pop().is_some() {
-                    write!(out, "\x1b[1D \x1b[1D")?;
+                    write!(out, "{BACK} {BACK}")?;
                 }
             }
 
@@ -209,6 +211,7 @@ impl SearchMode {
     }
 }
 
+#[derive(Debug)]
 struct DocViewMode {
     id: String,
     id_changed: bool,
@@ -270,7 +273,7 @@ impl DocViewMode {
             }
 
             KeyCode::Backspace => if self.id.pop().is_some() {
-                write!(out, "\x1b[1D \x1b[1D")?;
+                write!(out, "{BACK} {BACK}")?;
                 self.id_changed = true;
                 changed = true;
             }
@@ -285,7 +288,7 @@ impl DocViewMode {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum Mode {
     #[default]
     None,
@@ -336,7 +339,7 @@ async fn main_inner(
     enable_raw_mode()?;
     out.queue(ScrollUp(ctx.window_height))?
         .queue(MoveToPreviousLine(ctx.window_height))?;
-    write!(out, "{BOLD}Shrimple{NOSTYLE} documentation v{}{NL}", env!("CARGO_PKG_VERSION"))?;
+    write!(out, "{BOLD}Shrimple{RESET} documentation v{}{NL}", env!("CARGO_PKG_VERSION"))?;
     ctx.print_modes(out).await?;
     out.flush()?;
 
@@ -363,8 +366,8 @@ Usage: shrimple-docs [options]
 Options:
     --offline             Run without accessing the network
     --collect-failures    For every crate that couldn't be documented,
-                          save the stderr from its compilation in the current crate's target folder
-    -h, --help    Print help
+                      save the stderr from its compilation in the current crate's target directory
+    -h, --help            Print help
 ";
 
 struct Args {

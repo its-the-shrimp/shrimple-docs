@@ -1,14 +1,13 @@
 mod item_printer;
+mod markdown;
+mod line_view;
 
 use {
     crate::{
         docs::Docs,
-        errfmt,
-        utils::{
-            cmp, BoolExt, IntExt, IteratorExt, OptionExt, Result, UIntExt, WriteExt, BOLD, NL,
-            NOSTYLE, OK,
-        },
         docview::item_printer::print_item,
+        errfmt,
+        utils::{cmp, IntExt, IteratorExt, OptionExt, Result, UIntExt, BOLD, NL, OK, RESET, UNDERLINE},
     },
     anyhow::{bail, Context},
     crossterm::{
@@ -16,13 +15,16 @@ use {
         event::{KeyCode, KeyEvent, KeyModifiers},
         QueueableCommand,
     },
+    self::line_view::LineView,
+    markdown::Markdown,
     rustdoc_types::{Enum, Function, Id, Item, ItemEnum, ProcMacro, Struct, StructKind, Trait, Union},
-    std::{borrow::Cow, fmt::Write as _, mem::transmute, num::Saturating},
+    std::{borrow::Cow, fmt::Write as _, io::Write as _, mem::transmute, num::Saturating},
 };
 
+#[derive(Debug)]
 enum SectionKind {
     Text {
-        text: Box<str>,
+        text: Markdown<'static>,
         /// The length of the longest line of [`SectionKind::Text::text`]
         max_line_len: u32,
         /// The number of lines in [`SectionKind::Text::text`], which might be collapsed
@@ -33,6 +35,7 @@ enum SectionKind {
     },
 }
 
+#[derive(Debug)]
 struct Section {
     name: Cow<'static, str>,
     expanded: bool,
@@ -55,7 +58,11 @@ impl Section {
         Self {
             name,
             expanded: false,
-            kind: SectionKind::Text { text, max_line_len, n_lines: n_lines.0 },
+            kind: SectionKind::Text {
+                text: Markdown::parse(text),
+                max_line_len,
+                n_lines: n_lines.0,
+            },
         }
     }
 
@@ -103,21 +110,42 @@ impl Section {
         self._max_line_len(1)
     }
 
-    fn print(&self, out: &mut impl std::io::Write, indent: usize) -> Result {
-        for _ in 0 .. indent {
-            write!(out, "  ")?;
+    const fn is_empty(&self) -> bool {
+        match self.kind {
+            SectionKind::Text { n_lines, .. } => n_lines == 0,
+            SectionKind::Folder { ref subsections } => subsections.is_empty(),
         }
-        write!(out, "{} {BOLD}{}{NOSTYLE}{NL}", self.expanded.pick('-', '+'), self.name)?;
+    }
+
+    fn print(&self, out: &mut LineView<impl std::io::Write>, indent: usize) -> Result {
+        out.indent(indent)?;
+        let header_start = match (self.is_empty(), self.expanded) {
+            (true, _) => ' ',
+            (false, true) => '-',
+            (false, false) => '+',
+        };
+        write!(out, "{header_start} {BOLD}{}{RESET}", self.name)?;
+        out.new_line()?;
         if !self.expanded {
             return OK;
         }
 
         match &self.kind {
-            SectionKind::Text { text, .. } => for line in text.lines() {
-                for _ in 0 .. indent {
-                    write!(out, "  ")?;
+            SectionKind::Text { text, .. } => {
+                out.indent(indent)?;
+                for chunk in &text.chunks {
+                    match chunk {
+                        markdown::Chunk::Newline => {
+                            out.new_line()?;
+                            out.indent(indent)?;
+                        }
+                        markdown::Chunk::Text(text) => out.write_all(text.as_bytes())?,
+                        markdown::Chunk::Link { text, .. } => {
+                            write!(out, "{UNDERLINE}{}{RESET}", &**text)?;
+                        }
+                    }
                 }
-                write!(out, "  {line}{NL}")?;
+                out.new_line()?;
             }
             SectionKind::Folder { subsections } => for section in subsections {
                 section.print(out, indent.wrapping_add(1))?;
@@ -148,6 +176,7 @@ impl Section {
     }
 }
 
+#[derive(Debug)]
 pub struct DocView {
     sections: Vec<Section>,
     cursor_x: i32,
@@ -163,7 +192,7 @@ fn gather_items_docs<'item>(
     let mut res = vec![];
     let index = docs.index();
     add_items_docs(
-        ids.into_iter().filter_map(|id| index.get(&*id.0).inspect_none(|| err = Err(id))),
+        ids.into_iter().map_while(|id| index.get(&*id.0).inspect_none(|| err = Err(id))),
         &mut res,
         docs
     )?;
@@ -179,14 +208,12 @@ fn add_items_docs<'item>(
     docs: &Docs,
 ) -> Result {
     for item in items {
-        let mut content = String::new();
-        print_item(item, docs, &mut content)?;
-        write!(content, "\n{}", item.docs.as_deref().unwrap_or_default())?;
-        let mut name = content.lines().next().unwrap_or_default().to_owned();
-        content.drain(..name.len());
+        let mut name = String::new();
+        print_item(item, docs, &mut name)?;
         if name.bytes().last() == Some(b'\n') {
             name.pop();
         }
+        let content = item.docs.as_deref().unwrap_or_default().to_owned();
         dst.extend([Section::new(name, content)]);
     }
     OK
@@ -217,20 +244,20 @@ impl DocView {
 
             ItemEnum::Trait(Trait { items: ids, .. }) => {
                 #[expect(clippy::trivially_copy_pass_by_ref, reason = "easier to use")]
-                const fn is_provided(item: &&Item) -> bool {
-                    matches!(&item.inner, ItemEnum::Function(Function { has_body: true, .. })
-                                        | ItemEnum::AssocType { default: Some(_), .. }
-                                        | ItemEnum::AssocConst { default: Some(_), .. })
+                const fn is_required(item: &&Item) -> bool {
+                    matches!(&item.inner, ItemEnum::Function(Function { has_body: false, .. })
+                                        | ItemEnum::AssocType { default: None, .. }
+                                        | ItemEnum::AssocConst { default: None, .. })
                 }
 
                 let mut items: Vec<&Item> = ids.iter()
                     .map(|id| index.get(&*id.0).with_context(errfmt!("find item {:?}", id)))
                     .try_collect()?;
-                items.sort_unstable_by(|a, b| 
-                    cmp(&is_provided(b), &is_provided(b))
-                        .then_with(|| cmp(&b.name, &a.name)));
+                items.sort_unstable_by(|a, b| {
+                    cmp(&is_required(b), &is_required(a)).then_with(|| cmp(&b.name, &a.name))
+                });
 
-                let (required, provided) = items.split_at(items.partition_point(is_provided));
+                let (required, provided) = items.split_at(items.partition_point(is_required));
                 let mut item_docs = Vec::<Section>::new();
 
                 if !required.is_empty() {
@@ -261,7 +288,6 @@ impl DocView {
             | ItemEnum::TraitAlias(_)
             | ItemEnum::Impl(_)
             | ItemEnum::TypeAlias(_) // TODO: show the resulting type with the generics substituted
-            | ItemEnum::OpaqueTy(_)
             | ItemEnum::Constant { .. }
             | ItemEnum::Static(_)
             | ItemEnum::ForeignType
@@ -299,14 +325,7 @@ impl DocView {
         self.cursor_y = cursor_y;
     }
 
-    /// The returned integer is the offset from the header line of the section, if it's 0, the
-    /// cursor is on the header line
-    ///
-    /// If the closures returnes `false`, 
-    fn _innermost_hovered_section_mut(
-        &mut self,
-        mut must_break: impl Copy + FnMut(&mut Section) -> bool,
-    ) -> Option<(&mut Section, usize)> {
+    fn innermost_hovered_section_mut(&mut self) -> Option<(&mut Section, usize)> {
         let Ok(rem) = usize::try_from(self.cursor_y) else {
             return None;
         };
@@ -316,9 +335,6 @@ impl DocView {
                 section.fold_subsection(rem, move |rem, section| 
                     rem.checked_sub(1)
                         .and_then(|rem| {
-                            if must_break(section) {
-                                return None;
-                            }
                             if !section.expanded {
                                 return Some(rem);
                             }
@@ -329,10 +345,6 @@ impl DocView {
                         })
                         .ok_or((section, rem))))
             .err()
-    }
-
-    fn innermost_hovered_section_mut(&mut self) -> Option<(&mut Section, usize)> {
-        self._innermost_hovered_section_mut(|_| false)
     }
 
     /// Returns a boolean indicating whether the view needs needs to be re-rendered
@@ -375,7 +387,7 @@ impl DocView {
             },
 
             KeyCode::Enter => if let Some((section, 0)) = self.innermost_hovered_section_mut() {
-                section.expanded = !section.expanded;
+                section.expanded = !section.expanded && !section.is_empty();
             } else {
                 return false;
             }
@@ -398,12 +410,14 @@ impl DocView {
             write!(out, "{NL}")?;
         }
 
-        let mut out = out
-            .first_lines(margin_y.saturating_add_signed(cursor_y))
-            .skip_lines(cursor_y.saturating_sub_unsigned(margin_y).try_into().unwrap_or(0));
+        let mut out = LineView::new(
+            out,
+            cursor_y.saturating_sub_unsigned(margin_y).try_into().unwrap_or(0),
+            margin_y.saturating_add_signed(cursor_y),
+        );
         self.sections.iter().try_for_each(|s| s.print(&mut out, 0))?;
 
-        out.inner.inner
+        out.inner
             .queue(MoveDown(u16::MAX - 1))?
             .queue(MoveUp(small_margin_y))?
             .queue(MoveToColumn(self.cursor_x.try_into().unwrap_or(u16::MAX)))?;

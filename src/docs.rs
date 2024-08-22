@@ -2,7 +2,7 @@ use {
     crate::{
         cache,
         item_visitor::VisitorMut,
-        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, NOSTYLE, OK, YELLOW},
+        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, RESET, OK, YELLOW},
     },
     anyhow::{bail, ensure, Context},
     rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
@@ -102,6 +102,7 @@ impl DocsGen {
     ) -> Result<Self> {
         let Output { status, stdout, .. } = Command::new("rustup")
             .args(["run", &toolchain, "cargo", "metadata", "--format-version=1"])
+            .args(offline.then_some("--offline"))
             .stderr(Stdio::inherit())
             .output().await?;
         ensure!(status.success(), "`cargo metadata` failed");
@@ -145,7 +146,7 @@ impl DocsGen {
             return Ok(None);
         };
         let name = next.name.clone();
-        writeln!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} {name}")?;
+        writeln!(out, "{GREEN}{BOLD}   Documenting{RESET} {name}")?;
         match next.document(
             self.offline,
             self.collect_failures,
@@ -154,7 +155,7 @@ impl DocsGen {
         ).await {
             Ok(x) => Ok(Some(x)),
             Err(e) if e.is::<CompilationFailed>() => {
-                writeln!(out, "{YELLOW}{BOLD}        Failed{NOSTYLE} to document `{name}`")?;
+                writeln!(out, "{YELLOW}{BOLD}        Failed{RESET} to document `{name}`")?;
                 Ok(Some(vec![]))
             }
             Err(e) => Err(e),
@@ -253,7 +254,7 @@ fn parse_json_docs(path: impl AsRef<Path>) -> Result<Vec<(Arc<str>, Item)>> {
         crates: &docs.external_crates,
         temp: String::new(),
     };
-    
+
     docs.index.into_iter()
         .map(|(mut k, mut item)| {
             id_normaliser.visit_id(&mut k)?;
@@ -421,6 +422,7 @@ async fn get_std_docs_dir(toolchain: &str) -> Result<PathBuf> {
 }
 
 /// Filled in by [`Docs::search`]
+#[derive(Debug)]
 pub struct SearchResult {
     /// ID usable to index the docs directly.
     pub id: Arc<str>,
@@ -482,7 +484,7 @@ impl Docs {
         let mut index = HashMap::new();
         let toolchain = get_nightly_toolchain(r#in, out).await?;
 
-        writeln!(out, "{GREEN}{BOLD}    Extracting{NOSTYLE} crate and system metadata")?;
+        writeln!(out, "{GREEN}{BOLD}    Extracting{RESET} crate and system metadata")?;
         let (mut ctx, std_docs_dir) = try_join! {
             DocsGen::new(toolchain.clone(), offline, collect_failures),
             get_std_docs_dir(&toolchain),
@@ -517,7 +519,7 @@ impl Docs {
         if include_std_docs {
             for entry in std_docs_dir.read_dir()? {
                 let file = entry?.path();
-                write!(out, "{GREEN}{BOLD}   Documenting{NOSTYLE} ")?;
+                write!(out, "{GREEN}{BOLD}   Documenting{RESET} ")?;
                 out.write_all(file.file_stem().map_or(b"", OsStr::as_encoded_bytes))?;
                 writeln!(out)?;
                 let docs = parse_json_docs(file)?;

@@ -1,5 +1,10 @@
 use {
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::{
+        cursor::{MoveLeft, MoveToNextLine, MoveToPreviousLine},
+        event::{KeyCode, KeyEvent, KeyModifiers},
+        style::{Attribute, Color, SetForegroundColor}, terminal::Clear,
+    },
+    paste::paste,
     std::{
         cmp::Ordering,
         error::Error,
@@ -9,20 +14,21 @@ use {
         slice,
         str::from_utf8_unchecked,
     },
-    paste::paste,
 };
 
 pub type Result<T = (), E = anyhow::Error> = std::result::Result<T, E>;
 pub const OK: Result = Ok(());
 
-pub const INVERT: &str = "\x1b[7m";
-pub const BOLD: &str = "\x1b[1m";
-pub const GREEN: &str = "\x1b[32m";
-pub const YELLOW: &str = "\x1b[33m";
-pub const NOSTYLE: &str = "\x1b[0m";
-pub const PREVLINE: &str = "\x1b[1F";
-pub const NL: &str = "\x1b[1E\x1b[0G";
-pub const CLEARLINE: &str = "\x1b[2K\r";
+pub const UNDERLINE: Attribute = Attribute::Underlined;
+pub const BACK: MoveLeft = MoveLeft(1);
+pub const RESET: Attribute = Attribute::Reset;
+pub const REVERSE: Attribute = Attribute::Reverse;
+pub const BOLD: Attribute = Attribute::Bold;
+pub const GREEN: SetForegroundColor = SetForegroundColor(Color::Green);
+pub const YELLOW: SetForegroundColor = SetForegroundColor(Color::Yellow);
+pub const PREVLINE: MoveToPreviousLine = MoveToPreviousLine(1);
+pub const NL: MoveToNextLine = MoveToNextLine(1);
+pub const CLEARLINE: Clear = Clear(crossterm::terminal::ClearType::CurrentLine);
 pub const NULL_EVENT: KeyEvent = KeyEvent::new(KeyCode::Null, KeyModifiers::NONE);
 
 pub fn cmp<T: Ord>(a: &T, b: &T) -> Ordering {
@@ -179,71 +185,6 @@ impl<const CAP: usize> ShortStr<CAP> {
         unsafe { from_utf8_unchecked(slice::from_raw_parts(self.buf.as_ptr(), self.len as usize)) }
     }
 }
-
-/// Returns the index in `buf` 1 byte after the end of `rem` lines, updating `rem` according to how
-/// many lines the consumed slice encompasses.
-fn get_rem_lines_end(buf: &[u8], rem: &mut usize) -> usize {
-    match rem.checked_sub(1) {
-        None => 0,
-        Some(n) => buf
-            .windows(NL.len())
-            .enumerate()
-            .filter(|(_, seq)| *seq == NL.as_bytes())
-            .inspect(|_| *rem = rem.saturating_sub(1))
-            .nth(n)
-            .map_or(buf.len(), |(i, _)| i.wrapping_add(NL.len())),
-    }
-}
-
-pub struct SkipLines<Writer> {
-    pub inner: Writer,
-    rem: usize,
-}
-
-impl<Writer: std::io::Write> std::io::Write for SkipLines<Writer> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(&buf[get_rem_lines_end(buf, &mut self.rem) ..])
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(&buf[get_rem_lines_end(buf, &mut self.rem) ..])
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-pub struct FirstLines<Writer> {
-    pub inner: Writer,
-    rem: usize,
-}
-
-impl<Writer: std::io::Write> std::io::Write for FirstLines<Writer> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(&buf[.. get_rem_lines_end(buf, &mut self.rem)])
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(&buf[.. get_rem_lines_end(buf, &mut self.rem)])
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-pub trait WriteExt: std::io::Write + Sized {
-    fn skip_lines(self, n_lines: usize) -> SkipLines<Self> {
-        SkipLines { inner: self, rem: n_lines }
-    }
-
-    fn first_lines(self, n_lines: usize) -> FirstLines<Self> {
-        FirstLines { inner: self, rem: n_lines }
-    }
-}
-
-impl<Writer: std::io::Write> WriteExt for Writer {}
 
 macro_rules! impl_int_exts {
     ($trait_name:ident : $($int:ty),+ as $ptrsized_int:ty) => {
