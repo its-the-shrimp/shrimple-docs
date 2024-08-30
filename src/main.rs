@@ -253,7 +253,13 @@ impl DocViewMode {
     fn process_key_event(&mut self, event: &KeyEvent, ctx: &Ctx, out: &mut impl Write)
         -> Result<Option<Mode>>
     {
-        let mut changed = self.view.as_mut().is_some_and(|x| x.process_key_event(event));
+        let mut changed = match self.view.as_mut().and_then(|x| x.process_key_event(event)) {
+            None => false,
+            Some(docview::Action::Rerender) => true,
+            Some(docview::Action::Redirect(id)) => return Self::new(id, ctx)
+                .map(Mode::DocView)
+                .map(Some),
+        };
         match event.code {
             KeyCode::Enter => if self.id_changed {
                 let mut new_view = Self::get_view(&self.id, ctx)?;

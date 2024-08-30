@@ -3,11 +3,12 @@ mod markdown;
 mod line_view;
 
 use {
+    self::line_view::LineView,
     crate::{
-        docs::Docs,
-        docview::item_printer::print_item,
-        errfmt,
-        utils::{cmp, IntExt, IteratorExt, OptionExt, Result, UIntExt, BOLD, NL, OK, RESET, UNDERLINE},
+        docs::Docs, docview::item_printer::print_item, errfmt, shared_str::SharedStr, utils::{
+            cmp, BoolExt, IntExt, IteratorExt, OptionExt, Result, UIntExt, BOLD, NL, OK, RESET,
+            UNDERLINE,
+        }
     },
     anyhow::{bail, Context},
     crossterm::{
@@ -15,54 +16,43 @@ use {
         event::{KeyCode, KeyEvent, KeyModifiers},
         QueueableCommand,
     },
-    self::line_view::LineView,
-    markdown::Markdown,
-    rustdoc_types::{Enum, Function, Id, Item, ItemEnum, ProcMacro, Struct, StructKind, Trait, Union},
-    std::{borrow::Cow, fmt::Write as _, io::Write as _, mem::transmute, num::Saturating},
+    markdown::{Chunk, Markdown},
+    rustdoc_types::{
+        Enum, Function, Id, Item, ItemEnum, ProcMacro, Struct, StructKind, Trait, Union,
+    },
+    std::{borrow::{Borrow, Cow}, collections::HashMap, fmt::Write as _, hash::Hash, io::Write as _, mem::transmute},
 };
 
 #[derive(Debug)]
 enum SectionKind {
-    Text {
-        text: Markdown<'static>,
-        /// The length of the longest line of [`SectionKind::Text::text`]
-        max_line_len: u32,
-        /// The number of lines in [`SectionKind::Text::text`], which might be collapsed
-        n_lines: u32,
-    },
-    Folder {
-        subsections: Box<[Section]>,
-    },
+    Text(Markdown<'static>),
+    Folder(Box<[Section]>),
 }
 
 #[derive(Debug)]
 struct Section {
     name: Cow<'static, str>,
     expanded: bool,
+    /// If true & `expanded`is false, an ellipsis will be printed after the name
+    multiline_name: bool,
     kind: SectionKind,
 }
 
 impl Section {
-    fn new(name: impl Into<Cow<'static, str>>, text: impl Into<Box<str>>) -> Self {
-        Self::_new(name.into(), text.into())
+    fn empty(name: impl Into<Cow<'static, str>>) -> Self {
+        Self::new(name, "", &HashMap::<&str, &str>::new())
     }
 
-    fn _new(name: Cow<'static, str>, text: Box<str>) -> Self {
-        let mut n_lines = Saturating(0u32);
-        let max_line_len = text
-            .lines()
-            .inspect(|_| n_lines += 1)
-            .map(str::len)
-            .max()
-            .map_or(0, |x| x.try_into().unwrap_or(u32::MAX));
+    fn new(
+        name: impl Into<Cow<'static, str>>,
+        text: impl Into<SharedStr<'static>>,
+        links: &HashMap<impl Borrow<str> + Eq + Hash, impl Clone + Into<SharedStr<'static>>>,
+    ) -> Self {
         Self {
-            name,
+            name: name.into(),
             expanded: false,
-            kind: SectionKind::Text {
-                text: Markdown::parse(text),
-                max_line_len,
-                n_lines: n_lines.0,
-            },
+            multiline_name: false,
+            kind: SectionKind::Text(Markdown::parse(text.into(), links)),
         }
     }
 
@@ -73,7 +63,8 @@ impl Section {
         Self {
             name: name.into(),
             expanded: false,
-            kind: SectionKind::Folder { subsections: subsections.into() },
+            multiline_name: false,
+            kind: SectionKind::Folder(subsections.into()),
         }
     }
 
@@ -82,8 +73,8 @@ impl Section {
             return 1;
         }
         match &self.kind {
-            SectionKind::Text { n_lines, .. } => n_lines.into_usize(),
-            SectionKind::Folder { subsections, .. } => subsections
+            SectionKind::Text(text) => text.n_lines.into_usize(),
+            SectionKind::Folder(subsections) => subsections
                 .iter()
                 .map(|s| if s.expanded { s.count_lines().saturating_add(1) } else { 1 })
                 .fold(0, usize::saturating_add),
@@ -95,10 +86,10 @@ impl Section {
             return 0;
         }
         match &self.kind {
-            SectionKind::Text { max_line_len, .. } => max_line_len
+            SectionKind::Text(text) => text.max_line_len
                 .into_usize()
                 .saturating_add(indent.wrapping_mul(2)),
-            SectionKind::Folder { subsections, .. } => subsections
+            SectionKind::Folder(subsections) => subsections
                 .iter()
                 .map(|s| if s.expanded { s._max_line_len(indent.wrapping_add(1)) } else { 0 })
                 .max()
@@ -111,9 +102,9 @@ impl Section {
     }
 
     const fn is_empty(&self) -> bool {
-        match self.kind {
-            SectionKind::Text { n_lines, .. } => n_lines == 0,
-            SectionKind::Folder { ref subsections } => subsections.is_empty(),
+        match &self.kind {
+            SectionKind::Text(text) => text.n_lines == 0,
+            SectionKind::Folder(subsections) => subsections.is_empty(),
         }
     }
 
@@ -124,14 +115,16 @@ impl Section {
             (false, true) => '-',
             (false, false) => '+',
         };
-        write!(out, "{header_start} {BOLD}{}{RESET}", self.name)?;
+        let postfix = (self.multiline_name && !self.expanded).pick("...", "");
+        write!(out, "{header_start} {BOLD}{}{RESET}{postfix}", self.name)?;
         out.new_line()?;
         if !self.expanded {
             return OK;
         }
 
+        let indent = indent.wrapping_add(1);
         match &self.kind {
-            SectionKind::Text { text, .. } => {
+            SectionKind::Text(text) => {
                 out.indent(indent)?;
                 for chunk in &text.chunks {
                     match chunk {
@@ -140,15 +133,17 @@ impl Section {
                             out.indent(indent)?;
                         }
                         markdown::Chunk::Text(text) => out.write_all(text.as_bytes())?,
-                        markdown::Chunk::Link { text, .. } => {
-                            write!(out, "{UNDERLINE}{}{RESET}", &**text)?;
+                        markdown::Chunk::Link { text, dst } => if dst.is_some() {
+                            write!(out, "{UNDERLINE}{text}{RESET}")?;
+                        } else {
+                            write!(out, "[{text}]")?;
                         }
                     }
                 }
                 out.new_line()?;
             }
-            SectionKind::Folder { subsections } => for section in subsections {
-                section.print(out, indent.wrapping_add(1))?;
+            SectionKind::Folder(subsections) => for section in subsections {
+                section.print(out, indent)?;
             }
         }
         OK
@@ -158,19 +153,25 @@ impl Section {
     fn fold_subsection<'this, T: 'static, E>(
         &'this mut self,
         init: T,
-        mut f: impl Copy + FnMut(T, &'this mut Self) -> Result<T, E>
+        nesting: usize,
+        mut f: impl Copy + FnMut(T, usize, &'this mut Self) -> Result<T, E>
     ) -> Result<T, E> {
         let expanded = self.expanded;
-        let init = f(init, unsafe { transmute::<&mut Self, &'static mut Self>(&mut *self) })?;
+        let init = f(
+            init,
+            nesting,
+            unsafe { transmute::<&mut Self, &'static mut Self>(&mut *self) },
+        )?;
         if !expanded {
             return Ok(init);
         }
-        let SectionKind::Folder { subsections } = &mut self.kind else {
+        let SectionKind::Folder(subsections) = &mut self.kind else {
             return Ok(init);
         };
         let mut state = Some(init);
+        let nesting = nesting.wrapping_add(1);
         for subsection in subsections {
-            state = Some(subsection.fold_subsection(state.take().unwrap(), f)?);
+            state = Some(subsection.fold_subsection(state.take().unwrap(), nesting, f)?);
         }
         Ok(state.unwrap())
     }
@@ -210,13 +211,26 @@ fn add_items_docs<'item>(
     for item in items {
         let mut name = String::new();
         print_item(item, docs, &mut name)?;
-        if name.bytes().last() == Some(b'\n') {
+        let newline_before = name.find('\n').map_or(name.len(), |x| x.wrapping_add(1));
+        let mut content = name.split_off(newline_before);
+        let multiline_name = !content.is_empty();
+        if multiline_name { // Remove the trailing newline from the name if smth was split off
             name.pop();
         }
-        let content = item.docs.as_deref().unwrap_or_default().to_owned();
-        dst.extend([Section::new(name, content)]);
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(item.docs.as_deref().unwrap_or_default());
+        let mut section = Section::new(name, content, &item.links);
+        section.multiline_name = multiline_name;
+        dst.extend([section]);
     }
     OK
+}
+
+pub enum Action<'id> {
+    Rerender,
+    Redirect(&'id str),
 }
 
 impl DocView {
@@ -225,7 +239,7 @@ impl DocView {
         if !matches!(item.inner, ItemEnum::Module(_) | ItemEnum::ProcMacro(_)) {
             let mut decl_content = String::new();
             print_item(item, docs, &mut decl_content)?;
-            sections.push(Section::new("Definition", decl_content));
+            sections.push(Section::new("Definition", decl_content, &item.links));
         }
 
         let index = docs.index();
@@ -261,12 +275,12 @@ impl DocView {
                 let mut item_docs = Vec::<Section>::new();
 
                 if !required.is_empty() {
-                    item_docs.push(Section::new("Required:", ""));
+                    item_docs.push(Section::empty("Required:"));
                     add_items_docs(required.iter().copied(), &mut item_docs, docs)?;
                 }
 
                 if !provided.is_empty() {
-                    item_docs.push(Section::new("Provided:", ""));
+                    item_docs.push(Section::empty("Provided:"));
                     add_items_docs(provided.iter().copied(), &mut item_docs, docs)?;
                 }
 
@@ -278,7 +292,7 @@ impl DocView {
                 for attr_name in helpers {
                     writeln!(content, "#[{attr_name}]")?;
                 }
-                sections.push(Section::new("Helper attributes", content));
+                sections.push(Section::new("Helper attributes", content, &item.links));
             }
 
             | ItemEnum::Struct(Struct { kind: StructKind::Unit | StructKind::Tuple(_), .. })
@@ -300,7 +314,7 @@ impl DocView {
             | ItemEnum::ExternCrate { .. } => {},
         }
 
-        let mut desc = Section::new("Description", item.docs.clone().unwrap_or_default());
+        let mut desc = Section::new("Description", item.docs.clone().unwrap_or_default(), &item.links);
         if sections.is_empty() {
             desc.expanded = true;
         }
@@ -325,30 +339,28 @@ impl DocView {
         self.cursor_y = cursor_y;
     }
 
-    fn innermost_hovered_section_mut(&mut self) -> Option<(&mut Section, usize)> {
-        let Ok(rem) = usize::try_from(self.cursor_y) else {
-            return None;
-        };
+    /// Returns (section, level of nesting, vertical offset from the title)
+    fn innermost_hovered_section_mut(&mut self) -> Option<(&mut Section, usize, usize)> {
+        let rem = usize::try_from(self.cursor_y).ok()?;
 
         self.sections.iter_mut()
             .try_fold(rem, |rem, section|
-                section.fold_subsection(rem, move |rem, section| 
+                section.fold_subsection(rem, 0, move |rem, nesting, section| 
                     rem.checked_sub(1)
                         .and_then(|rem| {
                             if !section.expanded {
                                 return Some(rem);
                             }
-                            let SectionKind::Text { n_lines, .. } = section.kind else {
+                            let SectionKind::Text(text) = &section.kind else {
                                 return Some(rem);
                             };
-                            rem.checked_sub(n_lines.into_usize())
+                            rem.checked_sub(text.n_lines.into_usize())
                         })
-                        .ok_or((section, rem))))
+                        .ok_or((section, nesting, rem))))
             .err()
     }
 
-    /// Returns a boolean indicating whether the view needs needs to be re-rendered
-    pub fn process_key_event(&mut self, event: &KeyEvent) -> bool {
+    pub fn process_key_event<'self_>(&'self_ mut self, event: &KeyEvent) -> Option<Action<'self_>> {
         match event.code {
             KeyCode::Down => self.cursor_y = match event.modifiers {
                 KeyModifiers::NONE => self.cursor_y.saturating_add(1),
@@ -358,43 +370,52 @@ impl DocView {
                     .fold(0, usize::saturating_add)
                     .try_into()
                     .unwrap_or(i32::MAX),
-                _ => return false,
+                _ => return None,
             },
 
             KeyCode::Up => self.cursor_y = match event.modifiers {
                 KeyModifiers::NONE => self.cursor_y.saturating_sub(1),
                 KeyModifiers::SHIFT => 0,
-                _ => return false,
+                _ => return None,
             },
 
             KeyCode::Right => self.cursor_x = match event.modifiers {
                 KeyModifiers::NONE => self.cursor_x.saturating_add(1),
-                KeyModifiers::SHIFT => match self.sections
+                KeyModifiers::SHIFT => self.sections
                     .iter()
                     .map(Section::max_line_len)
-                    .max()
-                {
-                    Some(max_line_len) => max_line_len.try_into().unwrap_or(i32::MAX),
-                    _ => return false,
-                }
-                _ => return false,
+                    .max()?
+                    .try_into()
+                    .unwrap_or(i32::MAX),
+                _ => return None,
             },
 
             KeyCode::Left => self.cursor_x = match event.modifiers {
                 KeyModifiers::NONE => self.cursor_x.saturating_sub(1),
                 KeyModifiers::SHIFT => 0,
-                _ => return false,
+                _ => return None,
             },
 
-            KeyCode::Enter => if let Some((section, 0)) = self.innermost_hovered_section_mut() {
-                section.expanded = !section.expanded && !section.is_empty();
-            } else {
-                return false;
+            KeyCode::Enter => {
+                let x = self.cursor_x;
+                match self.innermost_hovered_section_mut()? {
+                    (section, _, 0) => section.expanded = !section.expanded && !section.is_empty(),
+                    (Section { kind: SectionKind::Text(text), .. }, nesting, y) => {
+                        let x = usize::try_from(x).ok()?.checked_sub(nesting.wrapping_mul(2))?;
+                        let y = y.checked_sub(1)?;
+                        return if let Chunk::Link { dst, .. } = text.chunk_at_pos(x, y)? {
+                            dst.as_deref().map(Action::Redirect)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => return None,
+                }
             }
 
-            _ => return false,
+            _ => return None,
         }
-        true
+        Some(Action::Rerender)
     }
 
     pub fn print(
