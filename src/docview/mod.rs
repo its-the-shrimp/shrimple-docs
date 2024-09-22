@@ -5,7 +5,11 @@ mod line_view;
 use {
     self::line_view::LineView,
     crate::{
-        docs::Docs, docview::item_printer::print_item, errfmt, shared_str::SharedStr, utils::{
+        docs::Docs,
+        docview::item_printer::print_item,
+        errfmt,
+        shared_str::SharedStr,
+        utils::{
             cmp, BoolExt, IntExt, IteratorExt, OptionExt, Result, UIntExt, BOLD, NL, OK, RESET,
             UNDERLINE,
         }
@@ -20,7 +24,14 @@ use {
     rustdoc_types::{
         Enum, Function, Id, Item, ItemEnum, ProcMacro, Struct, StructKind, Trait, Union,
     },
-    std::{borrow::{Borrow, Cow}, collections::HashMap, fmt::Write as _, hash::Hash, io::Write as _, mem::transmute},
+    std::{
+        borrow::{Borrow, Cow},
+        collections::HashMap,
+        fmt::Write as _,
+        hash::Hash,
+        io::Write as _,
+        mem::transmute,
+    },
 };
 
 #[derive(Debug)]

@@ -1,5 +1,5 @@
 use {
-    crate::utils::{Result, OK},
+    crate::{errfmt, utils::{Result, OK}},
     anyhow::Context,
     dirs::cache_dir,
     rustdoc_types::{Item, FORMAT_VERSION},
@@ -20,7 +20,7 @@ static CACHE_ROOT: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 
 const CACHE_FILENAME: &str = {
     assert!(FORMAT_VERSION == 33);
-    "33.json"
+    "33.bincode"
 };
 
 pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc<str>, Item)>>> {
@@ -30,13 +30,16 @@ pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc
 
     cache_path.extend([registry, name, version]);
     create_dir_all(&cache_path)
-        .with_context(|| format!("failed to create directory {cache_path:?}"))?;
+        .with_context(errfmt!("create directory {:?}", cache_path))?;
 
     cache_path.push(CACHE_FILENAME);
     if !cache_path.try_exists()? {
         return Ok(None);
     }
-    Ok(serde_json::from_reader(BufReader::new(File::open(cache_path)?))?)
+
+    bincode::deserialize_from(BufReader::new(File::open(&cache_path)?)) 
+        .map(Some)
+        .with_context(errfmt!("read cache from {:?}", cache_path))
 }
 
 pub fn store(items: &[(Arc<str>, Item)], registry: &str, name: &str, version: &str) -> Result {
@@ -45,16 +48,15 @@ pub fn store(items: &[(Arc<str>, Item)], registry: &str, name: &str, version: &s
         .context("failed to get the cache directory of the system")?;
 
     cache_path.extend([registry, name, version]);
-    create_dir_all(&cache_path)
-        .with_context(|| format!("failed to create directory {cache_path:?}"))?;
+    create_dir_all(&cache_path).with_context(errfmt!("create directory {:?}", cache_path))?;
 
     for entry in cache_path.read_dir()? {
         let path = entry?.path();
-        remove_file(&path)
-            .with_context(|| format!("failed to delete cache file {path:?}"))?;
+        remove_file(&path).with_context(errfmt!("delete cache file {:?}", path))?;
     }
 
     cache_path.push(CACHE_FILENAME);
-    serde_json::to_writer(BufWriter::new(File::create(cache_path)?), items)?;
+    bincode::serialize_into(BufWriter::new(File::create(&cache_path)?), items)
+        .with_context(errfmt!("write cache to {:?}", cache_path))?;
     OK
 }
