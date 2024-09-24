@@ -1,8 +1,9 @@
 use {
     crate::{
         cache,
+        errfmt,
         item_visitor::VisitorMut,
-        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, RESET, OK, YELLOW},
+        utils::{BoolExt, EmptyError, Exit, IteratorExt, Result, BOLD, GREEN, OK, RESET, YELLOW},
     },
     anyhow::{bail, ensure, Context},
     rustdoc_types::{Crate, ExternalCrate, Id, Item, ItemKind, ItemSummary, Type, FORMAT_VERSION},
@@ -24,6 +25,8 @@ use {
     },
     tokio::{io::{AsyncBufReadExt, AsyncReadExt, BufReader}, process::Command, try_join},
 };
+
+const STD_REGISTRY: &str = "std";
 
 /// contained in [`rustdoc_types::FnDecl::inputs`]
 pub type FnArg = (String, Type);
@@ -60,7 +63,7 @@ struct Target<'src> {
 #[derive(Debug, Deserialize)]
 struct Package<'src> {
     id: &'src str,
-    name: String,
+    name: Arc<str>,
     version: String,
     source: Option<String>,
     #[serde(default)]
@@ -122,9 +125,8 @@ impl DocsGen {
         for Dep { name, features } in deps {
             if features.is_empty() { continue }
         
-            let dep = packages.iter_mut().find(|x| &*x.name == name)
-                .with_context(|| format!("failed to unify dependency features: package {name:?} \
-                                          not found"))?;
+            let dep = packages.iter_mut().find(|x| &*x.crate_name == name)
+                .with_context(errfmt!("unify dependency features: package {:?} not found", name))?;
             if !dep.config.all_features {
                 dep.config.features.extend(features.into_iter().map(Into::into));
             }
@@ -145,7 +147,7 @@ impl DocsGen {
         let Some(next) = self.packages.next() else {
             return Ok(None);
         };
-        let name = next.name.clone();
+        let name = next.lib_name.clone();
         writeln!(out, "{GREEN}{BOLD}   Documenting{RESET} {name}")?;
         match next.document(
             self.offline,
@@ -277,9 +279,13 @@ struct DocConfig {
 }
 
 /// A package & its flags as given by the package for docs.rs
+#[derive(Debug)]
 struct Documentable {
     // TODO: allow for documenting multiple crates defined by 1 package
-    name: Arc<str>,
+    // name of the crate 
+    crate_name: Arc<str>,
+    /// name of the library
+    lib_name: Arc<str>,
     manifest_path: String,
     registry: Option<String>,
     version: String,
@@ -295,10 +301,11 @@ impl TryFrom<Package<'_>> for Documentable {
                 .unwrap_or_default();
         config.rustdoc_args.retain(|a| !matches!(&**a, "--generate-link-to-definition"));
         Ok(Self {
-            name: p.targets
+            lib_name: p.targets
                 .iter()
                 .find(|t| t.kind.contains(&"lib"))
                 .map_or_else(|| p.name.replace('-', "_").into(), |t| t.name.into()),
+            crate_name: p.name,
             manifest_path: p.manifest_path,
             registry: p.source,
             version: p.version,
@@ -328,7 +335,7 @@ impl Documentable {
         target_directory: impl AsRef<Path> + Send,
     ) -> Result<Vec<(Arc<str>, Item)>> {
         if let Some(Some(cached)) = self.registry.as_ref()
-            .map(|r| cache::load(r, &self.name, &self.version))
+            .map(|r| cache::load(r, &self.lib_name, &self.version))
             .transpose()?
         {
             return Ok(cached);
@@ -360,7 +367,7 @@ impl Documentable {
             .context("failed to launch `cargo rustdoc`")?;
         if !status.success() {
             if collect_failures {
-                let mut dst = target_directory.join(&*self.name);
+                let mut dst = target_directory.join(&*self.lib_name);
                 dst.set_extension("stderr");
                 fs::write(dst, stderr)?;
             }
@@ -368,12 +375,12 @@ impl Documentable {
         }
 
         let mut docs_path = target_directory.join("doc");
-        docs_path.push(&*self.name);
+        docs_path.push(&*self.lib_name);
         docs_path.set_extension("json");
 
         let res = parse_json_docs(docs_path)?;
         if let Some(registry) = &self.registry {
-            cache::store(&res, registry, &self.name, &self.version)?;
+            cache::store(&res, registry, &self.lib_name, &self.version)?;
         }
         Ok(res)
     }
@@ -419,6 +426,19 @@ async fn get_std_docs_dir(toolchain: &str) -> Result<PathBuf> {
     res.push(toolchain);
     res.push("share/doc/rust/json/");
     Ok(res)
+}
+
+async fn get_rustdoc_version(toolchain: &str) -> Result<String> {
+    let mut cmd = Command::new("rustup")
+        .args(["run", toolchain, "rustdoc", "-V"])
+        .stderr(Stdio::inherit())
+        .output().await?;
+    if !cmd.status.success() {
+        bail!("`rustdoc -V` failed");
+    }
+    let nl_at = cmd.stdout.iter().position(|&b| b == b'\n').unwrap_or(cmd.stdout.len());
+    cmd.stdout.truncate(nl_at);
+    String::from_utf8(cmd.stdout).context("`rustdoc -V` returned non-UTF8 data")
 }
 
 /// Filled in by [`Docs::search`]
@@ -485,9 +505,10 @@ impl Docs {
         let toolchain = get_nightly_toolchain(r#in, out).await?;
 
         writeln!(out, "{GREEN}{BOLD}    Extracting{RESET} crate and system metadata")?;
-        let (mut ctx, std_docs_dir) = try_join! {
+        let (mut ctx, std_docs_dir, rustdoc_version) = try_join! {
             DocsGen::new(toolchain.clone(), offline, collect_failures),
             get_std_docs_dir(&toolchain),
+            get_rustdoc_version(&toolchain),
         }?;
 
         let include_std_docs = std_docs_dir.try_exists()? || 'install_docs: {
@@ -519,10 +540,20 @@ impl Docs {
         if include_std_docs {
             for entry in std_docs_dir.read_dir()? {
                 let file = entry?.path();
-                write!(out, "{GREEN}{BOLD}   Documenting{RESET} ")?;
-                out.write_all(file.file_stem().map_or(b"", OsStr::as_encoded_bytes))?;
-                writeln!(out)?;
-                let docs = parse_json_docs(file)?;
+                let name = file.file_stem()
+                    .unwrap_or_default()
+                    .to_str()
+                    .with_context(errfmt!("document std docs at {:?}: non-UTF8 crate name", file))?;
+                writeln!(out, "{GREEN}{BOLD}   Documenting{RESET} {name}")?;
+
+                let docs = 'docs: {
+                    if let Some(cached) = cache::load(STD_REGISTRY, name, &rustdoc_version)? {
+                        break 'docs cached;
+                    }
+                    let docs = parse_json_docs(&file)?;
+                    cache::store(&docs, STD_REGISTRY, name, &rustdoc_version)?;
+                    docs
+                };
                 index.reserve(docs.len());
                 for (id, item) in docs {
                     if id.bytes().nth(1) != Some(b':') {

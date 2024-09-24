@@ -13,7 +13,7 @@ paste = "1"
 tokio = { version = "1", features = ["macros", "rt", "process", "io-util"] }
 dirs = "5"
 shrimple-parser = { git = "https://github.com/its-the-shrimp/shrimple-parser" }
-bincode = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [lints.clippy]
 # complexity = { level = "warn", priority = -1 }

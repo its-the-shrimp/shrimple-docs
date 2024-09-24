@@ -60,7 +60,7 @@ impl<'borrow> Markdown<'borrow> {
                         .skip(parse_while(' '))
                         .then(parse_while(AnyChar))
                         .map(|x| Some((x, true)))
-                        .narrow_reason(()),
+                        .map_reason(|x| match x {}),
                     parse_group('(', ')').and_value(false).maybe(),
                 })
                 .map(|(text, dst)| match dst {
@@ -68,7 +68,7 @@ impl<'borrow> Markdown<'borrow> {
                     Some((dst, false)) => RawChunk::Link { text, dst: Some(dst) },
                     None => RawChunk::Link { text, dst: None },
                 })
-                .or_nonempty(parse_until('[').map(RawChunk::Text).narrow_reason(()))
+                .or_nonempty(parse_until('[').map(RawChunk::Text).map_reason(|x| match x {}))
                 .iter(line)
                 .filter_map(Result::ok)
                 .chain([RawChunk::Newline]))

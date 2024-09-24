@@ -4,8 +4,8 @@ use {
     dirs::cache_dir,
     rustdoc_types::{Item, FORMAT_VERSION},
     std::{
-        fs::{create_dir_all, remove_file, File},
-        io::{BufReader, BufWriter},
+        fs::{self, create_dir_all, remove_file, File},
+        io::BufWriter,
         path::PathBuf,
         sync::{Arc, LazyLock},
     },
@@ -20,7 +20,7 @@ static CACHE_ROOT: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 
 const CACHE_FILENAME: &str = {
     assert!(FORMAT_VERSION == 33);
-    "33.bincode"
+    "33.postcard"
 };
 
 pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc<str>, Item)>>> {
@@ -37,9 +37,11 @@ pub fn load(registry: &str, name: &str, version: &str) -> Result<Option<Vec<(Arc
         return Ok(None);
     }
 
-    bincode::deserialize_from(BufReader::new(File::open(&cache_path)?)) 
+    let bytes = fs::read(&cache_path)
+        .with_context(errfmt!("read cache bytes from {:?}", cache_path))?;
+    postcard::from_bytes(&bytes)
         .map(Some)
-        .with_context(errfmt!("read cache from {:?}", cache_path))
+        .with_context(errfmt!("decode cache in {:?}", cache_path))
 }
 
 pub fn store(items: &[(Arc<str>, Item)], registry: &str, name: &str, version: &str) -> Result {
@@ -56,7 +58,7 @@ pub fn store(items: &[(Arc<str>, Item)], registry: &str, name: &str, version: &s
     }
 
     cache_path.push(CACHE_FILENAME);
-    bincode::serialize_into(BufWriter::new(File::create(&cache_path)?), items)
+    postcard::to_io(items, BufWriter::new(File::create(&cache_path)?))
         .with_context(errfmt!("write cache to {:?}", cache_path))?;
     OK
 }
